@@ -8,7 +8,6 @@ import android.content.ActivityNotFoundException;
 import android.content.ContentUris;
 import android.content.Context;
 import android.content.Intent;
-import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
@@ -23,6 +22,7 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
+import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
@@ -46,10 +46,10 @@ import java.util.Locale;
 import java.util.Set;
 
 /**
- * Rich dialogs & sheets for the KM Calendar main app:
+ * Rich dialogs & two-way editors for the KM Calendar main app:
  * 1) Day Events Overview Dialog (from Month grid tap)
- * 2) Event Detail Card (for both Google Calendar & Notion events)
- * 3) Native Quick-Create Event Form (+ shortcut to system Calendar editor)
+ * 2) Event Detail Card (with in-app Edit & Delete for BOTH Google Calendar & Notion events)
+ * 3) Unified Two-Way Event Editor (Create & Edit directly synced to Google Calendar or Notion API)
  * 4) Instant Live Search across Google + Notion events
  * 5) Quick Year/Month Jump Picker ("11月 ▾")
  */
@@ -64,6 +64,31 @@ public final class CalendarDialogs {
     private static final String[] DOW_NAMES = {
             "週一", "週二", "週三", "週四", "週五", "週六", "週日"
     };
+
+    private static final class TargetDestination {
+        final boolean isNotion;
+        final CalendarDataRepository.SystemCalendarItem sysCal;
+        final NotionManager.NotionSource notionSrc;
+        final int color;
+        final String displayLabel;
+
+        TargetDestination(CalendarDataRepository.SystemCalendarItem sysCal) {
+            this.isNotion = false;
+            this.sysCal = sysCal;
+            this.notionSrc = null;
+            this.color = sysCal.color;
+            this.displayLabel = "📅 " + sysCal.displayName
+                    + (TextUtils.isEmpty(sysCal.accountName) ? "" : " (" + sysCal.accountName + ")");
+        }
+
+        TargetDestination(Context ctx, NotionManager.NotionSource src) {
+            this.isNotion = true;
+            this.sysCal = null;
+            this.notionSrc = src;
+            this.color = NotionManager.getSourceColor(ctx, src);
+            this.displayLabel = "📓 Notion · " + src.fullTitleWithIcon();
+        }
+    }
 
     private CalendarDialogs() {
     }
@@ -205,7 +230,6 @@ public final class CalendarDialogs {
         root.setPadding(dp(activity, 20), dp(activity, 20), dp(activity, 20), dp(activity, 16));
         root.setBackgroundColor(palette.cardElevated);
 
-        // Color header pill + Title
         LinearLayout titleRow = new LinearLayout(activity);
         titleRow.setOrientation(LinearLayout.HORIZONTAL);
         titleRow.setGravity(Gravity.TOP);
@@ -230,7 +254,6 @@ public final class CalendarDialogs {
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         root.addView(titleRow);
 
-        // Date & Time
         LocalDate startD = LocalDate.ofEpochDay(ev.startEpochDay);
         ZoneId zone = ZoneId.systemDefault();
         String dateLine = String.format(Locale.TAIWAN, "%d年%d月%d日 %s（%s）\n⏰ %s",
@@ -240,7 +263,6 @@ public final class CalendarDialogs {
                 ev.formatTimeRange(zone));
         addDetailRow(activity, root, dateLine, palette.textPrimary, 14.5f, 12);
 
-        // Calendar Source & Status
         StringBuilder srcLine = new StringBuilder();
         srcLine.append(ev.isNotion() ? "📓 " : "📅 ");
         if (!TextUtils.isEmpty(ev.calendarName)) {
@@ -256,7 +278,6 @@ public final class CalendarDialogs {
         }
         addDetailRow(activity, root, srcLine.toString(), palette.textSecondary, 13.5f, 10);
 
-        // Location
         if (!TextUtils.isEmpty(ev.location)) {
             TextView locTv = addDetailRow(activity, root,
                     "📍 " + ev.location.trim() + "（點擊開啟地圖）",
@@ -270,7 +291,6 @@ public final class CalendarDialogs {
             });
         }
 
-        // Description
         if (!TextUtils.isEmpty(ev.description)) {
             ScrollView descScroll = new ScrollView(activity);
             TextView descTv = new TextView(activity);
@@ -288,61 +308,22 @@ public final class CalendarDialogs {
                 .setView(root)
                 .create();
 
-        // Action Buttons
-        LinearLayout actions = new LinearLayout(activity);
-        actions.setOrientation(LinearLayout.HORIZONTAL);
-        actions.setGravity(Gravity.END);
-        actions.setPadding(0, dp(activity, 18), 0, 0);
-
+        // Optional external link row (open in Notion app / system Google Calendar)
         if (ev.isNotion() && !TextUtils.isEmpty(ev.notionUrl)) {
-            Button closeBtn = makeFlatButton(activity, "關閉", palette.textPrimary, palette.chipBg);
-            closeBtn.setOnClickListener(v -> dialog.dismiss());
-            actions.addView(closeBtn);
-
-            Button openNotion = makeFlatButton(activity, "📓 在 Notion 開啟頁面", palette.todayText, palette.todayFill);
-            LinearLayout.LayoutParams oLp = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            oLp.setMarginStart(dp(activity, 8));
-            openNotion.setLayoutParams(oLp);
-            openNotion.setOnClickListener(v -> {
+            TextView extLink = addDetailRow(activity, root,
+                    "↗ 在 Notion 開啟完整頁面內容", palette.selectedStroke, 13.5f, 12);
+            extLink.setTypeface(Typeface.DEFAULT_BOLD);
+            extLink.setOnClickListener(v -> {
                 dialog.dismiss();
                 try {
                     activity.startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(ev.notionUrl)));
                 } catch (Exception ignored) {
                 }
             });
-            actions.addView(openNotion);
         } else if (ev.eventId >= 0L) {
-            Button delBtn = makeFlatButton(activity, "刪除", 0xFFD93025, palette.chipBg);
-            delBtn.setOnClickListener(v -> {
-                new AlertDialog.Builder(activity)
-                        .setTitle("刪除行程")
-                        .setMessage("確定要刪除「" + ev.title + "」嗎？")
-                        .setPositiveButton("刪除", (d, w) -> {
-                            if (!CalendarDataRepository.hasWritePermission(activity)) {
-                                callbacks.onRequestWritePermission();
-                                return;
-                            }
-                            boolean ok = CalendarDataRepository.deleteSystemEvent(activity, ev.eventId);
-                            if (ok) {
-                                dialog.dismiss();
-                                Toast.makeText(activity, "已刪除行程", Toast.LENGTH_SHORT).show();
-                                callbacks.onEventsMutated();
-                            } else {
-                                Toast.makeText(activity, "無法刪除此唯讀日曆行程", Toast.LENGTH_SHORT).show();
-                            }
-                        })
-                        .setNegativeButton("取消", null)
-                        .show();
-            });
-            actions.addView(delBtn);
-
-            Button editSys = makeFlatButton(activity, "✏️ 在系統日曆編輯", palette.todayText, palette.todayFill);
-            LinearLayout.LayoutParams eLp = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            eLp.setMarginStart(dp(activity, 8));
-            editSys.setLayoutParams(eLp);
-            editSys.setOnClickListener(v -> {
+            TextView extLink = addDetailRow(activity, root,
+                    "↗ 用系統 Google 日曆開啟（進階提醒／邀請對象）", palette.selectedStroke, 13f, 12);
+            extLink.setOnClickListener(v -> {
                 dialog.dismiss();
                 try {
                     Uri uri = ContentUris.withAppendedId(CalendarContract.Events.CONTENT_URI, ev.eventId);
@@ -353,7 +334,98 @@ public final class CalendarDialogs {
                 } catch (ActivityNotFoundException ignored) {
                 }
             });
-            actions.addView(editSys);
+        }
+
+        // Primary Action Buttons Row: Delete + Direct In-App Edit & Save
+        LinearLayout actions = new LinearLayout(activity);
+        actions.setOrientation(LinearLayout.HORIZONTAL);
+        actions.setGravity(Gravity.END);
+        actions.setPadding(0, dp(activity, 16), 0, 0);
+
+        if (ev.isNotion()) {
+            if (!TextUtils.isEmpty(ev.notionPageId)) {
+                Button delBtn = makeFlatButton(activity, "刪除", 0xFFD93025, palette.chipBg);
+                delBtn.setOnClickListener(v -> {
+                    new AlertDialog.Builder(activity)
+                            .setTitle("移至 Notion 垃圾桶")
+                            .setMessage("確定要在 Notion 將「" + ev.title + "」移至垃圾桶嗎？")
+                            .setPositiveButton("確定刪除", (d, w) -> {
+                                delBtn.setEnabled(false);
+                                delBtn.setText("刪除中…");
+                                NotionManager.trashNotionEventAsync(activity, ev.notionPageId,
+                                        new NotionManager.MutationCallback() {
+                                            @Override
+                                            public void onSuccess() {
+                                                dialog.dismiss();
+                                                Toast.makeText(activity, "✅ 已從 Notion 移至垃圾桶", Toast.LENGTH_SHORT).show();
+                                                callbacks.onEventsMutated();
+                                            }
+
+                                            @Override
+                                            public void onError(String message) {
+                                                delBtn.setEnabled(true);
+                                                delBtn.setText("刪除");
+                                                new AlertDialog.Builder(activity)
+                                                        .setTitle("刪除失敗")
+                                                        .setMessage(message)
+                                                        .setPositiveButton("好", null)
+                                                        .show();
+                                            }
+                                        });
+                            })
+                            .setNegativeButton("取消", null)
+                            .show();
+                });
+                actions.addView(delBtn);
+            }
+
+            Button editNotionBtn = makeFlatButton(
+                    activity, "✏️ 編輯並存回 Notion", palette.todayText, palette.todayFill);
+            LinearLayout.LayoutParams eLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            eLp.setMarginStart(dp(activity, 8));
+            editNotionBtn.setLayoutParams(eLp);
+            editNotionBtn.setOnClickListener(v -> {
+                dialog.dismiss();
+                showEventEditorDialog(activity, ev, LocalDate.ofEpochDay(ev.startEpochDay), -1, palette, callbacks);
+            });
+            actions.addView(editNotionBtn);
+        } else if (ev.eventId >= 0L) {
+            Button delBtn = makeFlatButton(activity, "刪除", 0xFFD93025, palette.chipBg);
+            delBtn.setOnClickListener(v -> {
+                new AlertDialog.Builder(activity)
+                        .setTitle("刪除行程")
+                        .setMessage("確定要刪除「" + ev.title + "」並同步回來源日曆嗎？")
+                        .setPositiveButton("刪除", (d, w) -> {
+                            if (!CalendarDataRepository.hasWritePermission(activity)) {
+                                callbacks.onRequestWritePermission();
+                                return;
+                            }
+                            boolean ok = CalendarDataRepository.deleteSystemEvent(activity, ev.eventId);
+                            if (ok) {
+                                dialog.dismiss();
+                                Toast.makeText(activity, "✅ 已刪除並同步回來源日曆", Toast.LENGTH_SHORT).show();
+                                callbacks.onEventsMutated();
+                            } else {
+                                Toast.makeText(activity, "此日曆為唯讀訂閱日曆，無法刪除", Toast.LENGTH_SHORT).show();
+                            }
+                        })
+                        .setNegativeButton("取消", null)
+                        .show();
+            });
+            actions.addView(delBtn);
+
+            Button editGoogleBtn = makeFlatButton(
+                    activity, "✏️ 直接編輯儲存", palette.todayText, palette.todayFill);
+            LinearLayout.LayoutParams eLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            eLp.setMarginStart(dp(activity, 8));
+            editGoogleBtn.setLayoutParams(eLp);
+            editGoogleBtn.setOnClickListener(v -> {
+                dialog.dismiss();
+                showEventEditorDialog(activity, ev, LocalDate.ofEpochDay(ev.startEpochDay), -1, palette, callbacks);
+            });
+            actions.addView(editGoogleBtn);
         } else {
             Button closeBtn = makeFlatButton(activity, "關閉", palette.textPrimary, palette.chipBg);
             closeBtn.setOnClickListener(v -> dialog.dismiss());
@@ -370,24 +442,85 @@ public final class CalendarDialogs {
             int initialHourOrNeg,
             AppTheme.Palette palette,
             Callbacks callbacks) {
+        showEventEditorDialog(activity, null, initialDate, initialHourOrNeg, palette, callbacks);
+    }
 
-        List<CalendarDataRepository.SystemCalendarItem> allCals =
-                CalendarDataRepository.loadSystemCalendars(activity);
-        List<CalendarDataRepository.SystemCalendarItem> writableCals = new ArrayList<>();
-        for (CalendarDataRepository.SystemCalendarItem c : allCals) {
-            if (c.writable) writableCals.add(c);
+    /**
+     * Unified Two-Way Event Editor supporting:
+     * - Creating new events directly into either Google Calendar OR Notion Database
+     * - Editing existing Google Calendar events (single or recurring) and syncing back to Google
+     * - Editing existing Notion Database events (title, date/time, status, notes) and writing back via Notion API
+     */
+    public static void showEventEditorDialog(
+            Activity activity,
+            CalendarEvent existingEvent,
+            LocalDate fallbackDate,
+            int initialHourOrNeg,
+            AppTheme.Palette palette,
+            Callbacks callbacks) {
+
+        final boolean isEdit = (existingEvent != null);
+        final boolean editingNotion = isEdit && existingEvent.isNotion();
+        final ZoneId zone = ZoneId.systemDefault();
+
+        // Check system event writability & recurrence metadata upfront when editing a Google/system event
+        final CalendarDataRepository.SystemEventMeta sysMeta = (!isEdit || editingNotion)
+                ? null
+                : CalendarDataRepository.inspectSystemEvent(activity, existingEvent.eventId);
+
+        if (isEdit && !editingNotion && sysMeta != null && !sysMeta.writable) {
+            Toast.makeText(activity, "「" + existingEvent.calendarName + "」為唯讀訂閱日曆，無法直接編輯", Toast.LENGTH_LONG).show();
+            return;
         }
 
-        ZoneId zone = ZoneId.systemDefault();
-        int defHour = initialHourOrNeg >= 0
-                ? initialHourOrNeg
-                : (initialDate.equals(LocalDate.now())
-                ? Math.min(22, LocalTime.now().getHour() + 1) : 9);
+        // Build target destinations list (writable Google Calendars + writable Notion Databases)
+        final List<TargetDestination> destinations = new ArrayList<>();
+        if (!isEdit || !editingNotion) {
+            for (CalendarDataRepository.SystemCalendarItem c : CalendarDataRepository.loadSystemCalendars(activity)) {
+                if (c.writable) destinations.add(new TargetDestination(c));
+            }
+        }
+        if (!isEdit) {
+            for (NotionManager.NotionSource ns : NotionManager.getWritableNotionSources(activity)) {
+                destinations.add(new TargetDestination(activity, ns));
+            }
+        }
 
-        final LocalDate[] startDate = {initialDate};
-        final LocalDate[] endDate = {initialDate};
-        final LocalTime[] startTime = {LocalTime.of(defHour, 0)};
-        final LocalTime[] endTime = {LocalTime.of(Math.min(23, defHour + 1), defHour >= 23 ? 59 : 0)};
+        // Initialize date & time state
+        final LocalDate[] startDate = new LocalDate[1];
+        final LocalDate[] endDate = new LocalDate[1];
+        final LocalTime[] startTime = new LocalTime[1];
+        final LocalTime[] endTime = new LocalTime[1];
+        final boolean initialAllDay;
+
+        if (isEdit) {
+            initialAllDay = existingEvent.allDay;
+            startDate[0] = LocalDate.ofEpochDay(existingEvent.startEpochDay);
+            endDate[0] = LocalDate.ofEpochDay(Math.max(existingEvent.startEpochDay, existingEvent.endEpochDay));
+            if (existingEvent.allDay || existingEvent.beginMillis <= 0L) {
+                startTime[0] = LocalTime.of(9, 0);
+                endTime[0] = LocalTime.of(10, 0);
+            } else {
+                ZonedDateTime bZdt = Instant.ofEpochMilli(existingEvent.beginMillis).atZone(zone);
+                long rawEnd = (existingEvent.hasExplicitEnd && existingEvent.endMillis > existingEvent.beginMillis)
+                        ? existingEvent.endMillis : (existingEvent.beginMillis + 3_600_000L);
+                ZonedDateTime eZdt = Instant.ofEpochMilli(rawEnd).atZone(zone);
+                startDate[0] = bZdt.toLocalDate();
+                endDate[0] = eZdt.toLocalDate();
+                startTime[0] = bZdt.toLocalTime().withSecond(0).withNano(0);
+                endTime[0] = eZdt.toLocalTime().withSecond(0).withNano(0);
+            }
+        } else {
+            initialAllDay = false;
+            int defHour = initialHourOrNeg >= 0
+                    ? initialHourOrNeg
+                    : (fallbackDate.equals(LocalDate.now())
+                    ? Math.min(22, LocalTime.now().getHour() + 1) : 9);
+            startDate[0] = fallbackDate;
+            endDate[0] = fallbackDate;
+            startTime[0] = LocalTime.of(defHour, 0);
+            endTime[0] = LocalTime.of(Math.min(23, defHour + 1), defHour >= 23 ? 59 : 0);
+        }
 
         ScrollView scroll = new ScrollView(activity);
         LinearLayout root = new LinearLayout(activity);
@@ -397,47 +530,91 @@ public final class CalendarDialogs {
         scroll.addView(root);
 
         TextView header = new TextView(activity);
-        header.setText("＋ 新增行程");
+        header.setText(isEdit
+                ? (editingNotion ? "✏️ 編輯 Notion 行程" : "✏️ 編輯行事曆行程")
+                : "＋ 新增行程（Google ／ Notion）");
         header.setTextSize(19f);
         header.setTypeface(Typeface.DEFAULT_BOLD);
         header.setTextColor(palette.textPrimary);
         root.addView(header);
 
+        if (isEdit && editingNotion) {
+            TextView badge = new TextView(activity);
+            badge.setText("📓 來源：" + existingEvent.calendarName + "（儲存後將直接同步回 Notion）");
+            badge.setTextSize(12.5f);
+            badge.setTextColor(palette.textSecondary);
+            badge.setPadding(0, dp(activity, 4), 0, 0);
+            root.addView(badge);
+        }
+
+        final boolean[] userEditedTitle = {false};
         EditText titleInput = new EditText(activity);
         titleInput.setHint("輸入行程標題");
         titleInput.setTextColor(palette.textPrimary);
         titleInput.setHintTextColor(palette.textSecondary);
         titleInput.setSingleLine(true);
+        if (isEdit) {
+            titleInput.setText(existingEvent.title);
+            titleInput.setSelection(titleInput.getText().length());
+        }
+        titleInput.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {
+            }
+
+            @Override
+            public void onTextChanged(CharSequence s, int start, int before, int count) {
+                userEditedTitle[0] = true;
+            }
+
+            @Override
+            public void afterTextChanged(Editable s) {
+            }
+        });
         LinearLayout.LayoutParams tLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         tLp.topMargin = dp(activity, 10);
         root.addView(titleInput, tLp);
 
-        // Calendar selector
-        Spinner calSpinner = new Spinner(activity);
-        if (!writableCals.isEmpty()) {
-            CharSequence[] labels = new CharSequence[writableCals.size()];
-            for (int i = 0; i < writableCals.size(); i++) {
-                CalendarDataRepository.SystemCalendarItem c = writableCals.get(i);
-                String raw = "● " + c.displayName + (TextUtils.isEmpty(c.accountName) ? "" : " (" + c.accountName + ")");
-                SpannableString sp = new SpannableString(raw);
-                sp.setSpan(new ForegroundColorSpan(c.color), 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        // Destination Spinner (shown when creating OR when editing a non-recurring Google event)
+        Spinner destSpinner = new Spinner(activity);
+        boolean showDestSpinner = !editingNotion && !destinations.isEmpty()
+                && (!isEdit || (sysMeta != null && !sysMeta.recurring));
+        int preselectIdx = 0;
+        if (showDestSpinner) {
+            CharSequence[] labels = new CharSequence[destinations.size()];
+            for (int i = 0; i < destinations.size(); i++) {
+                TargetDestination td = destinations.get(i);
+                SpannableString sp = new SpannableString("● " + td.displayLabel);
+                sp.setSpan(new ForegroundColorSpan(td.color), 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
                 labels[i] = sp;
+                if (isEdit && !td.isNotion && sysMeta != null && td.sysCal.id == sysMeta.calendarId) {
+                    preselectIdx = i;
+                }
             }
             ArrayAdapter<CharSequence> spinAdapter = new ArrayAdapter<>(
                     activity, android.R.layout.simple_spinner_dropdown_item, labels);
-            calSpinner.setAdapter(spinAdapter);
+            destSpinner.setAdapter(spinAdapter);
+            destSpinner.setSelection(preselectIdx);
             LinearLayout.LayoutParams spLp = new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
             spLp.topMargin = dp(activity, 8);
-            root.addView(calSpinner, spLp);
+            root.addView(destSpinner, spLp);
         }
 
         Switch allDaySwitch = new Switch(activity);
         allDaySwitch.setText("全天行程");
+        allDaySwitch.setChecked(initialAllDay);
         allDaySwitch.setTextColor(palette.textPrimary);
         allDaySwitch.setPadding(0, dp(activity, 10), 0, dp(activity, 6));
         root.addView(allDaySwitch);
+
+        TextView computedDateHint = new TextView(activity);
+        computedDateHint.setText("⚠️ 此 Notion 檢視的日期來自公式／關聯欄位（僅可修改標題與狀態）");
+        computedDateHint.setTextSize(12f);
+        computedDateHint.setTextColor(0xFFE65100);
+        computedDateHint.setVisibility(View.GONE);
+        root.addView(computedDateHint);
 
         Button btnStartDate = makeFlatButton(activity, "", palette.textPrimary, palette.chipBg);
         Button btnStartTime = makeFlatButton(activity, "", palette.textPrimary, palette.chipBg);
@@ -509,22 +686,118 @@ public final class CalendarDialogs {
 
         refreshTimeButtons.run();
 
+        // Notion Status / Select Row (dynamically shown when target is Notion and DB has status/select)
+        LinearLayout notionStatusContainer = new LinearLayout(activity);
+        notionStatusContainer.setOrientation(LinearLayout.VERTICAL);
+        notionStatusContainer.setVisibility(View.GONE);
+        TextView notionStatusLabel = new TextView(activity);
+        notionStatusLabel.setText("🏷️ Notion 狀態／分類");
+        notionStatusLabel.setTextSize(12.5f);
+        notionStatusLabel.setTypeface(Typeface.DEFAULT_BOLD);
+        notionStatusLabel.setTextColor(palette.textSecondary);
+        notionStatusLabel.setPadding(0, dp(activity, 10), 0, dp(activity, 2));
+        notionStatusContainer.addView(notionStatusLabel);
+        Spinner notionStatusSpinner = new Spinner(activity);
+        notionStatusContainer.addView(notionStatusSpinner);
+        root.addView(notionStatusContainer);
+
+        // Location input (for Google / System calendars)
         EditText locInput = new EditText(activity);
         locInput.setHint("地點（選填）");
         locInput.setTextColor(palette.textPrimary);
         locInput.setHintTextColor(palette.textSecondary);
         locInput.setSingleLine(true);
+        if (isEdit && !editingNotion) {
+            locInput.setText(existingEvent.location);
+        }
         LinearLayout.LayoutParams lLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         lLp.topMargin = dp(activity, 8);
         root.addView(locInput, lLp);
 
+        // Description / Notion Note input
         EditText descInput = new EditText(activity);
         descInput.setHint("備註說明（選填）");
         descInput.setTextColor(palette.textPrimary);
         descInput.setHintTextColor(palette.textSecondary);
-        descInput.setMaxLines(3);
+        descInput.setMaxLines(4);
+        if (isEdit && !editingNotion) {
+            descInput.setText(existingEvent.description);
+        }
         root.addView(descInput);
+
+        final NotionManager.NotionEditableSchema[] activeNotionSchema = {null};
+        final List<String> statusSpinnerValues = new ArrayList<>();
+
+        // Helper to load Notion schema for either editing a Notion page or creating in a Notion DB
+        final java.util.function.Consumer<String> loadNotionSchemaForKey = (srcKey) -> {
+            activeNotionSchema[0] = null;
+            notionStatusContainer.setVisibility(View.GONE);
+            String pid = editingNotion ? existingEvent.notionPageId : null;
+            NotionManager.fetchEditableSchemaAsync(activity, srcKey, pid,
+                    new NotionManager.SchemaCallback() {
+                        @Override
+                        public void onReady(NotionManager.NotionEditableSchema schema) {
+                            activeNotionSchema[0] = schema;
+                            if (editingNotion && !userEditedTitle[0] && !TextUtils.isEmpty(schema.livePlainTitle)) {
+                                titleInput.setText(schema.livePlainTitle);
+                                titleInput.setSelection(titleInput.getText().length());
+                                userEditedTitle[0] = false;
+                            }
+                            if (editingNotion && !TextUtils.isEmpty(schema.liveNoteText)
+                                    && descInput.getText().toString().isEmpty()) {
+                                descInput.setText(schema.liveNoteText);
+                            }
+                            if (!schema.dateEditable) {
+                                computedDateHint.setVisibility(View.VISIBLE);
+                                allDaySwitch.setEnabled(false);
+                                btnStartDate.setEnabled(false);
+                                btnEndDate.setEnabled(false);
+                                btnStartTime.setEnabled(false);
+                                btnEndTime.setEnabled(false);
+                            } else {
+                                computedDateHint.setVisibility(View.GONE);
+                                allDaySwitch.setEnabled(true);
+                                btnStartDate.setEnabled(true);
+                                btnEndDate.setEnabled(true);
+                                btnStartTime.setEnabled(true);
+                                btnEndTime.setEnabled(true);
+                            }
+
+                            if (!TextUtils.isEmpty(schema.statusPropName) && !schema.statusOptions.isEmpty()) {
+                                statusSpinnerValues.clear();
+                                statusSpinnerValues.add(""); // keep unchanged / default
+                                statusSpinnerValues.addAll(schema.statusOptions);
+
+                                List<String> displayItems = new ArrayList<>();
+                                displayItems.add("（保持預設／不變更）");
+                                displayItems.addAll(schema.statusOptions);
+
+                                notionStatusLabel.setText("🏷️ Notion 欄位：" + schema.statusPropName);
+                                ArrayAdapter<String> stAdapter = new ArrayAdapter<>(
+                                        activity, android.R.layout.simple_spinner_dropdown_item, displayItems);
+                                notionStatusSpinner.setAdapter(stAdapter);
+
+                                String targetStatus = !TextUtils.isEmpty(schema.liveStatus)
+                                        ? schema.liveStatus
+                                        : (editingNotion ? existingEvent.statusLabel : "");
+                                int sel = 0;
+                                for (int i = 1; i < statusSpinnerValues.size(); i++) {
+                                    if (statusSpinnerValues.get(i).equals(targetStatus)) {
+                                        sel = i;
+                                        break;
+                                    }
+                                }
+                                notionStatusSpinner.setSelection(sel);
+                                notionStatusContainer.setVisibility(View.VISIBLE);
+                            }
+                        }
+
+                        @Override
+                        public void onError(String message) {
+                        }
+                    });
+        };
 
         AlertDialog dialog = new AlertDialog.Builder(activity)
                 .setView(scroll)
@@ -535,62 +808,203 @@ public final class CalendarDialogs {
         actionRow.setGravity(Gravity.END);
         actionRow.setPadding(0, dp(activity, 14), 0, 0);
 
-        Button sysEditorBtn = makeFlatButton(activity, "系統完整編輯器", palette.textPrimary, palette.chipBg);
-        sysEditorBtn.setOnClickListener(v -> {
-            dialog.dismiss();
-            ZonedDateTime bZdt = startDate[0].atTime(startTime[0]).atZone(zone);
-            ZonedDateTime eZdt = endDate[0].atTime(endTime[0]).atZone(zone);
-            Intent insert = new Intent(Intent.ACTION_INSERT, CalendarContract.Events.CONTENT_URI)
-                    .putExtra(CalendarContract.Events.TITLE, titleInput.getText().toString().trim())
-                    .putExtra(CalendarContract.Events.EVENT_LOCATION, locInput.getText().toString().trim())
-                    .putExtra(CalendarContract.Events.DESCRIPTION, descInput.getText().toString().trim())
-                    .putExtra(CalendarContract.Events.ALL_DAY, allDaySwitch.isChecked())
-                    .putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, bZdt.toInstant().toEpochMilli())
-                    .putExtra(CalendarContract.EXTRA_EVENT_END_TIME, eZdt.toInstant().toEpochMilli());
-            try {
-                activity.startActivity(insert);
-            } catch (ActivityNotFoundException ignored) {
-            }
-        });
-        actionRow.addView(sysEditorBtn);
+        Button cancelBtn = makeFlatButton(activity, "取消", palette.textPrimary, palette.chipBg);
+        cancelBtn.setOnClickListener(v -> dialog.dismiss());
+        actionRow.addView(cancelBtn);
 
-        Button saveBtn = makeFlatButton(activity, "儲存行程", palette.todayText, palette.todayFill);
+        Button saveBtn = makeFlatButton(
+                activity,
+                editingNotion ? "💾 儲存並寫回 Notion" : "💾 儲存並同步",
+                palette.todayText,
+                palette.todayFill);
         LinearLayout.LayoutParams svLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         svLp.setMarginStart(dp(activity, 8));
         saveBtn.setLayoutParams(svLp);
+
+        if (editingNotion) {
+            locInput.setVisibility(View.GONE);
+            descInput.setHint("Notion 備註欄位（若資料庫含備註／說明文字欄將同步更新）");
+            loadNotionSchemaForKey.accept(existingEvent.sourceKey);
+        } else if (showDestSpinner) {
+            destSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+                @Override
+                public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                    TargetDestination td = destinations.get(position);
+                    if (td.isNotion) {
+                        locInput.setVisibility(View.GONE);
+                        descInput.setHint("Notion 備註／頁面內文（選填）");
+                        saveBtn.setText("💾 新增至 Notion");
+                        loadNotionSchemaForKey.accept(td.notionSrc.sourceKey);
+                    } else {
+                        computedDateHint.setVisibility(View.GONE);
+                        notionStatusContainer.setVisibility(View.GONE);
+                        locInput.setVisibility(View.VISIBLE);
+                        descInput.setHint("備註說明（選填）");
+                        saveBtn.setText("💾 儲存並同步");
+                    }
+                }
+
+                @Override
+                public void onNothingSelected(AdapterView<?> parent) {
+                }
+            });
+        }
+
         saveBtn.setOnClickListener(v -> {
             String title = titleInput.getText().toString().trim();
             if (title.isEmpty()) {
                 Toast.makeText(activity, "請輸入行程標題", Toast.LENGTH_SHORT).show();
                 return;
             }
+            boolean ad = allDaySwitch.isChecked();
+            ZonedDateTime bZdt = startDate[0].atTime(startTime[0]).atZone(zone);
+            ZonedDateTime eZdt = endDate[0].atTime(endTime[0]).atZone(zone);
+            if (!ad && !eZdt.isAfter(bZdt)) {
+                eZdt = bZdt.plusHours(1);
+            }
+            final ZonedDateTime finalBeginZdt = bZdt;
+            final ZonedDateTime finalEndZdt = eZdt;
+
+            TargetDestination chosenDest = (showDestSpinner && !destinations.isEmpty())
+                    ? destinations.get(Math.max(0, destSpinner.getSelectedItemPosition()))
+                    : null;
+
+            boolean targetIsNotion = editingNotion || (chosenDest != null && chosenDest.isNotion);
+
+            if (targetIsNotion) {
+                String chosenStatus = "";
+                if (notionStatusContainer.getVisibility() == View.VISIBLE
+                        && notionStatusSpinner.getSelectedItemPosition() > 0
+                        && notionStatusSpinner.getSelectedItemPosition() < statusSpinnerValues.size()) {
+                    chosenStatus = statusSpinnerValues.get(notionStatusSpinner.getSelectedItemPosition());
+                }
+                String noteVal = descInput.getText().toString().trim();
+                saveBtn.setEnabled(false);
+                saveBtn.setText("⏳ 同步至 Notion…");
+
+                NotionManager.MutationCallback mutCb = new NotionManager.MutationCallback() {
+                    @Override
+                    public void onSuccess() {
+                        dialog.dismiss();
+                        Toast.makeText(activity,
+                                editingNotion ? "✅ 已儲存並同步回 Notion！" : "✅ 已新增行程至 Notion！",
+                                Toast.LENGTH_SHORT).show();
+                        callbacks.onEventsMutated();
+                    }
+
+                    @Override
+                    public void onError(String message) {
+                        saveBtn.setEnabled(true);
+                        saveBtn.setText(editingNotion ? "💾 儲存並寫回 Notion" : "💾 新增至 Notion");
+                        new AlertDialog.Builder(activity)
+                                .setTitle("寫入 Notion 失敗")
+                                .setMessage(message)
+                                .setPositiveButton("好", null)
+                                .show();
+                    }
+                };
+
+                if (editingNotion) {
+                    NotionManager.updateNotionEventAsync(
+                            activity,
+                            existingEvent.sourceKey,
+                            existingEvent.notionPageId,
+                            activeNotionSchema[0],
+                            title, ad, startDate[0], endDate[0],
+                            finalBeginZdt, finalEndZdt, chosenStatus, noteVal, mutCb);
+                } else {
+                    NotionManager.createNotionEventAsync(
+                            activity,
+                            chosenDest.notionSrc.sourceKey,
+                            activeNotionSchema[0],
+                            title, ad, startDate[0], endDate[0],
+                            finalBeginZdt, finalEndZdt, chosenStatus, noteVal, mutCb);
+                }
+                return;
+            }
+
+            // Google / System Calendar Create or Edit
             if (!CalendarDataRepository.hasWritePermission(activity)) {
                 callbacks.onRequestWritePermission();
                 return;
             }
-            if (writableCals.isEmpty()) {
-                Toast.makeText(activity, "找不到可寫入的系統行事曆，將開啟系統編輯器", Toast.LENGTH_SHORT).show();
-                sysEditorBtn.performClick();
+
+            String locVal = locInput.getText().toString().trim();
+            String descVal = descInput.getText().toString().trim();
+            long beginMs = finalBeginZdt.toInstant().toEpochMilli();
+            long endMs = finalEndZdt.toInstant().toEpochMilli();
+
+            if (!isEdit) {
+                if (chosenDest == null || chosenDest.sysCal == null) {
+                    // Fallback to system calendar intent if no writable local calendar found
+                    Intent insert = new Intent(Intent.ACTION_INSERT, CalendarContract.Events.CONTENT_URI)
+                            .putExtra(CalendarContract.Events.TITLE, title)
+                            .putExtra(CalendarContract.Events.EVENT_LOCATION, locVal)
+                            .putExtra(CalendarContract.Events.DESCRIPTION, descVal)
+                            .putExtra(CalendarContract.Events.ALL_DAY, ad)
+                            .putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, beginMs)
+                            .putExtra(CalendarContract.EXTRA_EVENT_END_TIME, endMs);
+                    dialog.dismiss();
+                    try {
+                        activity.startActivity(insert);
+                    } catch (ActivityNotFoundException ignored) {
+                    }
+                    return;
+                }
+
+                long insertedId = CalendarDataRepository.insertSystemEvent(
+                        activity, chosenDest.sysCal.id, title, locVal, descVal,
+                        ad, startDate[0], endDate[0], beginMs, endMs);
+                if (insertedId >= 0) {
+                    dialog.dismiss();
+                    Toast.makeText(activity, "✅ 已新增並同步回 Google／系統日曆", Toast.LENGTH_SHORT).show();
+                    callbacks.onEventsMutated();
+                } else {
+                    Toast.makeText(activity, "新增失敗，請確認日曆寫入權限", Toast.LENGTH_SHORT).show();
+                }
                 return;
             }
-            int idx = Math.max(0, calSpinner.getSelectedItemPosition());
-            long calId = writableCals.get(idx).id;
-            long beginMs = startDate[0].atTime(startTime[0]).atZone(zone).toInstant().toEpochMilli();
-            long endMs = endDate[0].atTime(endTime[0]).atZone(zone).toInstant().toEpochMilli();
 
-            long insertedId = CalendarDataRepository.insertSystemEvent(
-                    activity, calId, title,
-                    locInput.getText().toString().trim(),
-                    descInput.getText().toString().trim(),
-                    allDaySwitch.isChecked(),
-                    startDate[0], endDate[0], beginMs, endMs);
-            if (insertedId >= 0) {
-                dialog.dismiss();
-                Toast.makeText(activity, "✅ 已新增行程", Toast.LENGTH_SHORT).show();
-                callbacks.onEventsMutated();
+            // Editing an existing System / Google Calendar event
+            final long targetCalId = (chosenDest != null && chosenDest.sysCal != null)
+                    ? chosenDest.sysCal.id
+                    : (sysMeta != null ? sysMeta.calendarId : -1L);
+            final boolean isRec = sysMeta != null && sysMeta.recurring;
+
+            if (isRec) {
+                String[] scopeChoices = {"只修改這一次行程", "修改整個重複系列"};
+                new AlertDialog.Builder(activity)
+                        .setTitle("這是重複性行程")
+                        .setItems(scopeChoices, (scDialog, which) -> {
+                            boolean onlyThis = (which == 0);
+                            boolean ok = CalendarDataRepository.updateSystemEvent(
+                                    activity, existingEvent.eventId, targetCalId,
+                                    existingEvent.beginMillis, existingEvent.allDay,
+                                    true, onlyThis, title, locVal, descVal,
+                                    ad, startDate[0], endDate[0], beginMs, endMs);
+                            if (ok) {
+                                dialog.dismiss();
+                                Toast.makeText(activity, "✅ 已儲存並同步回 Google／系統日曆", Toast.LENGTH_SHORT).show();
+                                callbacks.onEventsMutated();
+                            } else {
+                                Toast.makeText(activity, "更新失敗", Toast.LENGTH_SHORT).show();
+                            }
+                        })
+                        .show();
             } else {
-                Toast.makeText(activity, "新增失敗，請改用系統完整編輯器", Toast.LENGTH_SHORT).show();
+                boolean ok = CalendarDataRepository.updateSystemEvent(
+                        activity, existingEvent.eventId, targetCalId,
+                        existingEvent.beginMillis, existingEvent.allDay,
+                        false, false, title, locVal, descVal,
+                        ad, startDate[0], endDate[0], beginMs, endMs);
+                if (ok) {
+                    dialog.dismiss();
+                    Toast.makeText(activity, "✅ 已儲存並同步回 Google／系統日曆", Toast.LENGTH_SHORT).show();
+                    callbacks.onEventsMutated();
+                } else {
+                    Toast.makeText(activity, "更新失敗，此行程可能屬於唯讀日曆", Toast.LENGTH_SHORT).show();
+                }
             }
         });
         actionRow.addView(saveBtn);

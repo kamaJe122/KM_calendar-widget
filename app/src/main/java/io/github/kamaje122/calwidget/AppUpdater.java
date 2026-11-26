@@ -77,16 +77,16 @@ public final class AppUpdater {
             PackageInfo pInfo = context.getPackageManager().getPackageInfo(context.getPackageName(), 0);
             return (int) pInfo.getLongVersionCode();
         } catch (Exception e) {
-            return 9;
+            return 10;
         }
     }
 
     public static String getCurrentVersionName(Context context) {
         try {
             PackageInfo pInfo = context.getPackageManager().getPackageInfo(context.getPackageName(), 0);
-            return pInfo.versionName != null ? pInfo.versionName : "3.0.0";
+            return pInfo.versionName != null ? pInfo.versionName : "3.1.0";
         } catch (Exception e) {
-            return "3.0.0";
+            return "3.1.0";
         }
     }
 

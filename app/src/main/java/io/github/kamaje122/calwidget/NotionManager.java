@@ -10,12 +10,16 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
+import java.net.InetSocketAddress;
 import java.net.URL;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
@@ -24,6 +28,8 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -31,14 +37,22 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SNIHostName;
+import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
 
 /**
  * Bulletproof Notion Calendar / Database & Views sync manager:
@@ -1016,6 +1030,7 @@ public final class NotionManager {
 
             CalendarWidgetProvider.Event ev = new CalendarWidgetProvider.Event();
             ev.eventId = -1L;
+            ev.notionPageId = nev.pageId == null ? "" : nev.pageId;
             ev.sourceKey = nev.sourceKey;
             ev.notionUrl = nev.notionUrl;
             ev.allDay = nev.allDay;
@@ -1085,6 +1100,7 @@ public final class NotionManager {
 
             CalendarEvent ce = new CalendarEvent();
             ce.eventId = -1L;
+            ce.notionPageId = nev.pageId == null ? "" : nev.pageId;
             ce.sourceKey = nev.sourceKey;
             ce.title = TextUtils.isEmpty(nev.title) ? context.getString(R.string.untitled) : nev.title;
             ce.calendarName = src.fullTitleWithIcon();
@@ -1962,6 +1978,556 @@ public final class NotionManager {
         }
     }
 
+    // ==================== TWO-WAY NOTION CREATE / EDIT / TRASH ====================
+
+    public static final class NotionEditableSchema {
+        public final String titlePropName;
+        public final boolean dateEditable;
+        public final String datePropName;
+        public final String endDatePropName;
+        public final String statusPropName;
+        public final String statusPropType; // "status" or "select" or ""
+        public final List<String> statusOptions;
+        public final String notePropName;
+        public final String livePlainTitle;
+        public final String liveStatus;
+        public final String liveNoteText;
+
+        NotionEditableSchema(String titlePropName, boolean dateEditable, String datePropName,
+                             String endDatePropName, String statusPropName, String statusPropType,
+                             List<String> statusOptions, String notePropName,
+                             String livePlainTitle, String liveStatus, String liveNoteText) {
+            this.titlePropName = titlePropName;
+            this.dateEditable = dateEditable;
+            this.datePropName = datePropName;
+            this.endDatePropName = endDatePropName;
+            this.statusPropName = statusPropName;
+            this.statusPropType = statusPropType;
+            this.statusOptions = statusOptions;
+            this.notePropName = notePropName;
+            this.livePlainTitle = livePlainTitle;
+            this.liveStatus = liveStatus;
+            this.liveNoteText = liveNoteText;
+        }
+    }
+
+    public interface SchemaCallback {
+        void onReady(NotionEditableSchema schema);
+        void onError(String message);
+    }
+
+    public interface MutationCallback {
+        void onSuccess();
+        void onError(String message);
+    }
+
+    private static final Map<String, JSONObject> DS_SCHEMA_MEM_CACHE = new ConcurrentHashMap<>();
+
+    public static List<NotionSource> getWritableNotionSources(Context context) {
+        if (!hasToken(context)) return Collections.emptyList();
+        CachedWorkspace ws = loadCache(context);
+        if (ws == null || ws.sources.isEmpty()) return Collections.emptyList();
+        List<NotionSource> out = new ArrayList<>();
+        Set<String> seenDbProp = new HashSet<>();
+        for (NotionSource src : ws.sources) {
+            if (!"date".equals(src.datePropType)) continue;
+            // Deduplicate identical (dataSourceId + datePropId) so the target selector stays crisp
+            String dedupKey = src.dataSourceId + "|" + src.datePropName;
+            if (seenDbProp.add(dedupKey)) {
+                out.add(src);
+            }
+        }
+        return out;
+    }
+
+    public static void fetchEditableSchemaAsync(
+            Context context, String sourceKey, String optionalPageId, SchemaCallback callback) {
+        final Context appContext = context.getApplicationContext();
+        String token = getToken(appContext);
+        if (token.isEmpty()) {
+            if (callback != null) MAIN_HANDLER.post(() -> callback.onError("尚未設定 Notion Token"));
+            return;
+        }
+        EXECUTOR.execute(() -> {
+            try {
+                NotionSource src = findSourceByKey(appContext, sourceKey);
+                if (src == null) {
+                    if (callback != null) MAIN_HANDLER.post(() -> callback.onError("找不到對應的 Notion 資料庫設定"));
+                    return;
+                }
+                NotionEditableSchema schema = resolveSchemaBlocking(token, src, optionalPageId);
+                if (callback != null) {
+                    MAIN_HANDLER.post(() -> callback.onReady(schema));
+                }
+            } catch (Exception e) {
+                if (callback != null) {
+                    final String m = e.getMessage() != null ? e.getMessage() : "讀取欄位失敗";
+                    MAIN_HANDLER.post(() -> callback.onError(m));
+                }
+            }
+        });
+    }
+
+    private static NotionEditableSchema resolveSchemaBlocking(
+            String token, NotionSource src, String optionalPageId) throws Exception {
+        JSONObject propsSchema = DS_SCHEMA_MEM_CACHE.get(src.dataSourceId);
+        if (propsSchema == null) {
+            HttpResult dsRes = requestNotion(token, "GET", "/data_sources/" + src.dataSourceId, null, null);
+            if (dsRes.code == 200) {
+                JSONObject p = new JSONObject(dsRes.body).optJSONObject("properties");
+                if (p != null) {
+                    propsSchema = p;
+                    DS_SCHEMA_MEM_CACHE.put(src.dataSourceId, p);
+                }
+            } else if (!TextUtils.isEmpty(src.databaseId)) {
+                HttpResult dbRes = executeNotionHttp(
+                        token, "GET", "/databases/" + src.databaseId, null, NOTION_VERSION_LEGACY, null);
+                if (dbRes.code == 200) {
+                    JSONObject p = new JSONObject(dbRes.body).optJSONObject("properties");
+                    if (p != null) {
+                        propsSchema = p;
+                        DS_SCHEMA_MEM_CACHE.put(src.dataSourceId, p);
+                    }
+                }
+            }
+        }
+
+        String titleProp = "";
+        String statusProp = "";
+        String statusType = "";
+        List<String> statusOpts = new ArrayList<>();
+        String noteProp = "";
+
+        if (propsSchema != null) {
+            // Pass 1: find title, status, and note-like rich_text
+            Iterator<String> it = propsSchema.keys();
+            while (it.hasNext()) {
+                String k = it.next();
+                JSONObject p = propsSchema.optJSONObject(k);
+                if (p == null) continue;
+                String t = p.optString("type", "");
+                if ("title".equals(t) && titleProp.isEmpty()) {
+                    titleProp = k;
+                } else if ("status".equals(t) && statusProp.isEmpty()) {
+                    statusProp = k;
+                    statusType = "status";
+                    JSONObject stCfg = p.optJSONObject("status");
+                    if (stCfg != null) {
+                        JSONArray opts = stCfg.optJSONArray("options");
+                        if (opts != null) {
+                            for (int i = 0; i < opts.length(); i++) {
+                                String n = optCleanString(opts.optJSONObject(i), "name");
+                                if (!n.isEmpty()) statusOpts.add(n);
+                            }
+                        }
+                    }
+                } else if ("rich_text".equals(t) && noteProp.isEmpty()) {
+                    String lower = k.toLowerCase(Locale.ROOT);
+                    if (lower.contains("備註") || lower.contains("說明") || lower.contains("描述")
+                            || lower.contains("地點") || lower.contains("內容")
+                            || lower.contains("note") || lower.contains("desc") || lower.contains("location")) {
+                        noteProp = k;
+                    }
+                }
+            }
+            // Pass 2: if no "status" column exists, check for a status-like "select" column
+            if (statusProp.isEmpty()) {
+                Iterator<String> it2 = propsSchema.keys();
+                while (it2.hasNext()) {
+                    String k = it2.next();
+                    JSONObject p = propsSchema.optJSONObject(k);
+                    if (p == null || !"select".equals(p.optString("type"))) continue;
+                    String lower = k.toLowerCase(Locale.ROOT);
+                    if (lower.contains("狀態") || lower.contains("分類") || lower.contains("類別")
+                            || lower.contains("status") || lower.contains("type") || lower.contains("category")) {
+                        statusProp = k;
+                        statusType = "select";
+                        JSONObject selCfg = p.optJSONObject("select");
+                        if (selCfg != null) {
+                            JSONArray opts = selCfg.optJSONArray("options");
+                            if (opts != null) {
+                                for (int i = 0; i < opts.length(); i++) {
+                                    String n = optCleanString(opts.optJSONObject(i), "name");
+                                    if (!n.isEmpty()) statusOpts.add(n);
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        String liveTitle = "";
+        String liveStatus = "";
+        String liveNote = "";
+
+        if (!TextUtils.isEmpty(optionalPageId)) {
+            HttpResult pageRes = requestNotion(
+                    token, "GET", "/pages/" + formatUuid(optionalPageId), null, null);
+            if (pageRes.code == 200) {
+                JSONObject pageJson = new JSONObject(pageRes.body);
+                JSONObject pageProps = pageJson.optJSONObject("properties");
+                if (pageProps != null) {
+                    Iterator<String> pk = pageProps.keys();
+                    while (pk.hasNext()) {
+                        String k = pk.next();
+                        JSONObject p = pageProps.optJSONObject(k);
+                        if (p == null) continue;
+                        String t = p.optString("type", "");
+                        if ("title".equals(t)) {
+                            if (titleProp.isEmpty()) titleProp = k;
+                            liveTitle = extractPlainText(p.optJSONArray("title")).trim();
+                        } else if (!statusProp.isEmpty() && k.equals(statusProp)) {
+                            JSONObject obj = p.optJSONObject(statusType);
+                            if (obj != null) liveStatus = optCleanString(obj, "name");
+                        } else if (!noteProp.isEmpty() && k.equals(noteProp)) {
+                            liveNote = extractPlainText(p.optJSONArray("rich_text")).trim();
+                        }
+                    }
+                }
+            }
+        }
+
+        if (titleProp.isEmpty()) titleProp = "title";
+        boolean dateEditable = "date".equals(src.datePropType);
+
+        return new NotionEditableSchema(
+                titleProp,
+                dateEditable,
+                src.datePropName,
+                src.endDatePropName,
+                statusProp,
+                statusType,
+                statusOpts,
+                noteProp,
+                liveTitle,
+                liveStatus,
+                liveNote
+        );
+    }
+
+    public static void createNotionEventAsync(
+            Context context,
+            String sourceKey,
+            NotionEditableSchema schemaOrNull,
+            String title,
+            boolean allDay,
+            LocalDate startDate,
+            LocalDate endDate,
+            ZonedDateTime beginZdt,
+            ZonedDateTime endZdt,
+            String statusOption,
+            String noteText,
+            MutationCallback callback) {
+
+        final Context appContext = context.getApplicationContext();
+        String token = getToken(appContext);
+        if (token.isEmpty()) {
+            postMutErr(callback, "尚未設定 Notion Token");
+            return;
+        }
+
+        EXECUTOR.execute(() -> {
+            try {
+                NotionSource src = findSourceByKey(appContext, sourceKey);
+                if (src == null) {
+                    postMutErr(callback, "找不到指定的 Notion 資料庫");
+                    return;
+                }
+                NotionEditableSchema schema = schemaOrNull != null
+                        ? schemaOrNull
+                        : resolveSchemaBlocking(token, src, null);
+
+                JSONObject props = buildMutationPropertiesJson(
+                        schema, title, allDay, startDate, endDate, beginZdt, endZdt, statusOption, noteText);
+
+                JSONObject body = new JSONObject();
+                body.put("parent", new JSONObject()
+                        .put("type", "data_source_id")
+                        .put("data_source_id", formatUuid(src.dataSourceId)));
+                body.put("properties", props);
+
+                // If database has no dedicated note column and user wrote notes, attach as page body blocks
+                if (TextUtils.isEmpty(schema.notePropName) && !TextUtils.isEmpty(noteText)) {
+                    body.put("children", buildParagraphBlocksJson(noteText));
+                }
+
+                HttpResult res = requestNotion(token, "POST", "/pages", body.toString(), null);
+                if (res.code == 400 && !TextUtils.isEmpty(src.databaseId)) {
+                    // Fallback to database_id parent if workspace requires it
+                    body.put("parent", new JSONObject()
+                            .put("database_id", formatUuid(src.databaseId)));
+                    res = requestNotion(token, "POST", "/pages", body.toString(), null);
+                }
+
+                if (res.code == 403) {
+                    postMutErr(callback, "Notion 權限不足 (HTTP 403)：\n請到 Notion Integration 設定頁勾選「Insert content（新增內容）」並按 Save！");
+                    return;
+                }
+                if (res.code < 200 || res.code >= 300) {
+                    postMutErr(callback, "寫入 Notion 失敗 (HTTP " + res.code + ")：" + res.errorMsg);
+                    return;
+                }
+
+                JSONObject createdPage = new JSONObject(res.body);
+                upsertPageIntoLocalCache(appContext, src.dataSourceId, createdPage);
+                CalendarWidgetProvider.updateAll(appContext);
+                // Follow-up background sync so server-side view filters stay 100% consistent
+                MAIN_HANDLER.postDelayed(() -> refreshEventsOnlyAsync(appContext, 0L, null), 1200L);
+
+                if (callback != null) MAIN_HANDLER.post(callback::onSuccess);
+            } catch (Exception e) {
+                postMutErr(callback, "新增至 Notion 失敗：" + e.getMessage());
+            }
+        });
+    }
+
+    public static void updateNotionEventAsync(
+            Context context,
+            String sourceKey,
+            String pageId,
+            NotionEditableSchema schemaOrNull,
+            String title,
+            boolean allDay,
+            LocalDate startDate,
+            LocalDate endDate,
+            ZonedDateTime beginZdt,
+            ZonedDateTime endZdt,
+            String statusOption,
+            String noteText,
+            MutationCallback callback) {
+
+        final Context appContext = context.getApplicationContext();
+        String token = getToken(appContext);
+        if (token.isEmpty()) {
+            postMutErr(callback, "尚未設定 Notion Token");
+            return;
+        }
+        if (TextUtils.isEmpty(pageId)) {
+            postMutErr(callback, "缺少 Notion 頁面 ID，請先重新整理同步一次");
+            return;
+        }
+
+        EXECUTOR.execute(() -> {
+            try {
+                NotionSource src = findSourceByKey(appContext, sourceKey);
+                if (src == null) {
+                    postMutErr(callback, "找不到對應的 Notion 資料庫");
+                    return;
+                }
+                NotionEditableSchema schema = schemaOrNull != null
+                        ? schemaOrNull
+                        : resolveSchemaBlocking(token, src, pageId);
+
+                JSONObject props = buildMutationPropertiesJson(
+                        schema, title, allDay, startDate, endDate, beginZdt, endZdt, statusOption, noteText);
+                JSONObject body = new JSONObject().put("properties", props);
+
+                HttpResult res = requestNotion(
+                        token, "PATCH", "/pages/" + formatUuid(pageId), body.toString(), null);
+                if (res.code == 403) {
+                    postMutErr(callback, "Notion 權限不足 (HTTP 403)：\n請到 Notion Integration 設定頁勾選「Update content（更新內容）」並按 Save！");
+                    return;
+                }
+                if (res.code < 200 || res.code >= 300) {
+                    postMutErr(callback, "儲存至 Notion 失敗 (HTTP " + res.code + ")：" + res.errorMsg);
+                    return;
+                }
+
+                JSONObject updatedPage = new JSONObject(res.body);
+                upsertPageIntoLocalCache(appContext, src.dataSourceId, updatedPage);
+                CalendarWidgetProvider.updateAll(appContext);
+                MAIN_HANDLER.postDelayed(() -> refreshEventsOnlyAsync(appContext, 0L, null), 1200L);
+
+                if (callback != null) MAIN_HANDLER.post(callback::onSuccess);
+            } catch (Exception e) {
+                postMutErr(callback, "更新 Notion 失敗：" + e.getMessage());
+            }
+        });
+    }
+
+    public static void trashNotionEventAsync(
+            Context context, String pageId, MutationCallback callback) {
+        final Context appContext = context.getApplicationContext();
+        String token = getToken(appContext);
+        if (token.isEmpty() || TextUtils.isEmpty(pageId)) {
+            postMutErr(callback, "缺少 Notion Token 或頁面 ID");
+            return;
+        }
+        EXECUTOR.execute(() -> {
+            try {
+                String body = new JSONObject().put("in_trash", true).toString();
+                HttpResult res = requestNotion(
+                        token, "PATCH", "/pages/" + formatUuid(pageId), body, null);
+                if (res.code == 403) {
+                    postMutErr(callback, "Notion 權限不足 (HTTP 403)：請確認 Integration 已勾選「Update content」！");
+                    return;
+                }
+                if (res.code < 200 || res.code >= 300) {
+                    postMutErr(callback, "移至 Notion 垃圾桶失敗 (HTTP " + res.code + ")：" + res.errorMsg);
+                    return;
+                }
+                removePageFromLocalCache(appContext, pageId);
+                CalendarWidgetProvider.updateAll(appContext);
+                if (callback != null) MAIN_HANDLER.post(callback::onSuccess);
+            } catch (Exception e) {
+                postMutErr(callback, "刪除 Notion 行程失敗：" + e.getMessage());
+            }
+        });
+    }
+
+    private static JSONObject buildMutationPropertiesJson(
+            NotionEditableSchema schema,
+            String title,
+            boolean allDay,
+            LocalDate startDate,
+            LocalDate endDate,
+            ZonedDateTime beginZdt,
+            ZonedDateTime endZdt,
+            String statusOption,
+            String noteText) throws Exception {
+
+        JSONObject props = new JSONObject();
+
+        // 1. Title property
+        JSONArray titleArr = new JSONArray().put(new JSONObject()
+                .put("type", "text")
+                .put("text", new JSONObject().put("content", title)));
+        props.put(schema.titlePropName, new JSONObject().put("title", titleArr));
+
+        // 2. Date property (when backed by an editable Notion `date` property)
+        if (schema.dateEditable && !TextUtils.isEmpty(schema.datePropName)) {
+            String startIso;
+            String endIso = null;
+            if (allDay) {
+                startIso = startDate.toString();
+                if (endDate != null && endDate.isAfter(startDate)) {
+                    endIso = endDate.toString();
+                }
+            } else {
+                startIso = beginZdt.format(DateTimeFormatter.ISO_OFFSET_DATE_TIME);
+                if (endZdt != null && endZdt.isAfter(beginZdt)) {
+                    endIso = endZdt.format(DateTimeFormatter.ISO_OFFSET_DATE_TIME);
+                }
+            }
+
+            if (!TextUtils.isEmpty(schema.endDatePropName)
+                    && !schema.endDatePropName.equals(schema.datePropName)) {
+                JSONObject startDateObj = new JSONObject().put("start", startIso);
+                props.put(schema.datePropName, new JSONObject().put("date", startDateObj));
+                if (endIso != null) {
+                    JSONObject endDateObj = new JSONObject().put("start", endIso);
+                    props.put(schema.endDatePropName, new JSONObject().put("date", endDateObj));
+                }
+            } else {
+                JSONObject dateObj = new JSONObject().put("start", startIso);
+                dateObj.put("end", endIso != null ? endIso : JSONObject.NULL);
+                props.put(schema.datePropName, new JSONObject().put("date", dateObj));
+            }
+        }
+
+        // 3. Optional Status / Select property
+        if (!TextUtils.isEmpty(schema.statusPropName)
+                && !TextUtils.isEmpty(schema.statusPropType)
+                && !TextUtils.isEmpty(statusOption)) {
+            props.put(schema.statusPropName, new JSONObject()
+                    .put(schema.statusPropType, new JSONObject().put("name", statusOption)));
+        }
+
+        // 4. Optional Rich-Text Note property
+        if (!TextUtils.isEmpty(schema.notePropName) && noteText != null) {
+            JSONArray rt = new JSONArray();
+            if (!noteText.trim().isEmpty()) {
+                rt.put(new JSONObject()
+                        .put("type", "text")
+                        .put("text", new JSONObject().put("content", noteText.trim())));
+            }
+            props.put(schema.notePropName, new JSONObject().put("rich_text", rt));
+        }
+
+        return props;
+    }
+
+    private static JSONArray buildParagraphBlocksJson(String text) throws Exception {
+        JSONArray children = new JSONArray();
+        for (String line : text.split("\n")) {
+            JSONArray rt = new JSONArray().put(new JSONObject()
+                    .put("type", "text")
+                    .put("text", new JSONObject().put("content", line)));
+            children.put(new JSONObject()
+                    .put("object", "block")
+                    .put("type", "paragraph")
+                    .put("paragraph", new JSONObject().put("rich_text", rt)));
+        }
+        return children;
+    }
+
+    private static NotionSource findSourceByKey(Context context, String sourceKey) {
+        CachedWorkspace ws = loadCache(context);
+        if (ws == null) return null;
+        for (NotionSource s : ws.sources) {
+            if (s.sourceKey.equals(sourceKey)) return s;
+        }
+        return ws.sources.isEmpty() ? null : ws.sources.get(0);
+    }
+
+    private static void upsertPageIntoLocalCache(Context context, String dataSourceId, JSONObject pageJson) {
+        CachedWorkspace ws = loadCache(context);
+        if (ws == null) return;
+        String targetPageUuid = normalizeUuid(pageJson.optString("id"));
+        if (targetPageUuid.isEmpty()) return;
+
+        ZoneId zone = ZoneId.systemDefault();
+        String normDs = normalizeUuid(dataSourceId);
+        List<NotionCachedEvent> updatedEvents = new ArrayList<>();
+        Set<String> matchedSourceKeys = new HashSet<>();
+
+        for (NotionCachedEvent ev : ws.events) {
+            if (normalizeUuid(ev.pageId).equals(targetPageUuid)) {
+                matchedSourceKeys.add(ev.sourceKey);
+                continue;
+            }
+            updatedEvents.add(ev);
+        }
+
+        for (NotionSource src : ws.sources) {
+            if (!normalizeUuid(src.dataSourceId).equals(normDs)) continue;
+            // Re-insert into sources that previously held it, or non-filtered views of the same DB
+            if (matchedSourceKeys.contains(src.sourceKey)
+                    || matchedSourceKeys.isEmpty()
+                    || TextUtils.isEmpty(src.filterJson)) {
+                NotionCachedEvent parsed = parsePageToEvent(pageJson, src, zone);
+                if (parsed != null) {
+                    updatedEvents.add(parsed);
+                }
+            }
+        }
+
+        saveCache(context, new CachedWorkspace(
+                ws.workspaceName, ws.sources, ws.databases, updatedEvents, ws.diagnosticNote));
+    }
+
+    private static void removePageFromLocalCache(Context context, String pageId) {
+        CachedWorkspace ws = loadCache(context);
+        if (ws == null) return;
+        String normId = normalizeUuid(pageId);
+        List<NotionCachedEvent> kept = new ArrayList<>();
+        for (NotionCachedEvent ev : ws.events) {
+            if (!normalizeUuid(ev.pageId).equals(normId)) {
+                kept.add(ev);
+            }
+        }
+        saveCache(context, new CachedWorkspace(
+                ws.workspaceName, ws.sources, ws.databases, kept, ws.diagnosticNote));
+    }
+
+    private static void postMutErr(MutationCallback cb, String msg) {
+        if (cb != null) {
+            MAIN_HANDLER.post(() -> cb.onError(msg));
+        }
+    }
+
     private static HttpResult requestNotion(
             String token, String method, String path, String jsonBody, String betaHeader) {
         HttpResult primary = executeNotionHttp(token, method, path, jsonBody, NOTION_VERSION_PRIMARY, betaHeader);
@@ -1973,6 +2539,9 @@ public final class NotionManager {
 
     private static HttpResult executeNotionHttp(
             String token, String method, String path, String jsonBody, String version, String betaHeader) {
+        if ("PATCH".equalsIgnoreCase(method)) {
+            return executeNotionTlsPatch(token, path, jsonBody, version, betaHeader);
+        }
         for (int attempt = 0; attempt < 3; attempt++) {
             HttpURLConnection conn = null;
             try {
@@ -2039,5 +2608,161 @@ public final class NotionManager {
             }
         }
         return new HttpResult(-1, "", "網路連線逾時");
+    }
+
+    /**
+     * Android's HttpURLConnection rejects setRequestMethod("PATCH") with ProtocolException.
+     * Sends RFC-compliant HTTPS HTTP/1.1 PATCH over verified TLS socket directly to api.notion.com.
+     */
+    private static HttpResult executeNotionTlsPatch(
+            String token, String path, String jsonBody, String version, String betaHeader) {
+        final String host = "api.notion.com";
+        byte[] payload = (jsonBody != null ? jsonBody : "{}").getBytes(StandardCharsets.UTF_8);
+
+        for (int attempt = 0; attempt < 3; attempt++) {
+            SSLSocket socket = null;
+            try {
+                SSLSocketFactory factory = HttpsURLConnection.getDefaultSSLSocketFactory();
+                socket = (SSLSocket) factory.createSocket();
+                socket.connect(new InetSocketAddress(host, 443), 15_000);
+                socket.setSoTimeout(20_000);
+
+                SSLParameters sslParams = socket.getSSLParameters();
+                sslParams.setServerNames(Collections.singletonList(new SNIHostName(host)));
+                sslParams.setEndpointIdentificationAlgorithm("HTTPS");
+                socket.setSSLParameters(sslParams);
+                socket.startHandshake();
+
+                if (!HttpsURLConnection.getDefaultHostnameVerifier().verify(host, socket.getSession())) {
+                    throw new IOException("TLS 主機憑證驗證失敗");
+                }
+
+                StringBuilder req = new StringBuilder();
+                req.append("PATCH /v1").append(path).append(" HTTP/1.1\r\n");
+                req.append("Host: ").append(host).append("\r\n");
+                req.append("Authorization: Bearer ").append(token).append("\r\n");
+                req.append("Notion-Version: ").append(version).append("\r\n");
+                if (!TextUtils.isEmpty(betaHeader)) {
+                    req.append("Notion-Beta: ").append(betaHeader).append("\r\n");
+                }
+                req.append("Accept: application/json\r\n");
+                req.append("Accept-Encoding: identity\r\n");
+                req.append("Content-Type: application/json; charset=utf-8\r\n");
+                req.append("Content-Length: ").append(payload.length).append("\r\n");
+                req.append("Connection: close\r\n\r\n");
+
+                OutputStream out = socket.getOutputStream();
+                out.write(req.toString().getBytes(StandardCharsets.UTF_8));
+                out.write(payload);
+                out.flush();
+
+                InputStream in = socket.getInputStream();
+                String statusLine = readAsciiHeaderLine(in);
+                if (statusLine == null || !statusLine.startsWith("HTTP/")) {
+                    throw new IOException("無效的伺服器回應");
+                }
+                int code = 500;
+                String[] statusParts = statusLine.split(" ");
+                if (statusParts.length >= 2) {
+                    code = Integer.parseInt(statusParts[1].trim());
+                }
+
+                boolean chunked = false;
+                int contentLength = -1;
+                String hdrLine;
+                while ((hdrLine = readAsciiHeaderLine(in)) != null && !hdrLine.isEmpty()) {
+                    int colon = hdrLine.indexOf(':');
+                    if (colon > 0) {
+                        String k = hdrLine.substring(0, colon).trim().toLowerCase(Locale.ROOT);
+                        String v = hdrLine.substring(colon + 1).trim().toLowerCase(Locale.ROOT);
+                        if ("transfer-encoding".equals(k) && v.contains("chunked")) {
+                            chunked = true;
+                        } else if ("content-length".equals(k)) {
+                            try {
+                                contentLength = Integer.parseInt(v);
+                            } catch (NumberFormatException ignored) {
+                            }
+                        }
+                    }
+                }
+
+                if ((code == 429 || code == 503 || code == 529) && attempt < 2) {
+                    socket.close();
+                    Thread.sleep((1 + attempt) * 1000L);
+                    continue;
+                }
+
+                ByteArrayOutputStream bodyBytes = new ByteArrayOutputStream();
+                if (chunked) {
+                    while (true) {
+                        String sizeLine = readAsciiHeaderLine(in);
+                        if (sizeLine == null) break;
+                        int semi = sizeLine.indexOf(';');
+                        if (semi >= 0) sizeLine = sizeLine.substring(0, semi);
+                        sizeLine = sizeLine.trim();
+                        if (sizeLine.isEmpty()) continue;
+                        int chunkLen = Integer.parseInt(sizeLine, 16);
+                        if (chunkLen <= 0) break;
+                        readExactBytes(in, bodyBytes, chunkLen);
+                        readAsciiHeaderLine(in); // consume trailing CRLF
+                    }
+                } else if (contentLength >= 0) {
+                    readExactBytes(in, bodyBytes, contentLength);
+                } else {
+                    byte[] buf = new byte[4096];
+                    int n;
+                    while ((n = in.read(buf)) != -1) {
+                        bodyBytes.write(buf, 0, n);
+                    }
+                }
+
+                String respText = new String(bodyBytes.toByteArray(), StandardCharsets.UTF_8);
+                String errMsg = "";
+                if (code >= 400 && !respText.isEmpty()) {
+                    try {
+                        errMsg = new JSONObject(respText).optString("message", respText);
+                    } catch (Exception ignored) {
+                        errMsg = respText;
+                    }
+                }
+                return new HttpResult(code, respText, errMsg);
+            } catch (Exception e) {
+                if (attempt == 2) {
+                    return new HttpResult(-1, "", e.getMessage() != null ? e.getMessage() : "TLS PATCH 連線異常");
+                }
+            } finally {
+                if (socket != null) {
+                    try {
+                        socket.close();
+                    } catch (IOException ignored) {
+                    }
+                }
+            }
+        }
+        return new HttpResult(-1, "", "網路連線逾時");
+    }
+
+    private static String readAsciiHeaderLine(InputStream in) throws IOException {
+        ByteArrayOutputStream line = new ByteArrayOutputStream(128);
+        int b;
+        boolean readAny = false;
+        while ((b = in.read()) != -1) {
+            readAny = true;
+            if (b == '\n') break;
+            if (b != '\r') line.write(b);
+        }
+        if (!readAny && line.size() == 0) return null;
+        return new String(line.toByteArray(), StandardCharsets.US_ASCII);
+    }
+
+    private static void readExactBytes(InputStream in, ByteArrayOutputStream out, int count) throws IOException {
+        byte[] buf = new byte[Math.min(4096, Math.max(1, count))];
+        int remaining = count;
+        while (remaining > 0) {
+            int n = in.read(buf, 0, Math.min(buf.length, remaining));
+            if (n == -1) break;
+            out.write(buf, 0, n);
+            remaining -= n;
+        }
     }
 }

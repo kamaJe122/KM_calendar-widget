@@ -82,6 +82,7 @@ public class CalendarWidgetProvider extends AppWidgetProvider {
 
     public static final class Event {
         long eventId = -1L;
+        String notionPageId = "";
         String sourceKey = "";
         String notionUrl = "";
         String title = "";
@@ -586,6 +587,7 @@ public class CalendarWidgetProvider extends AppWidgetProvider {
 
                     CalendarEvent ce = new CalendarEvent();
                     ce.eventId = ev.eventId;
+                    ce.notionPageId = ev.notionPageId == null ? "" : ev.notionPageId;
                     ce.sourceKey = ev.sourceKey == null ? "" : ev.sourceKey;
                     ce.title = ev.title == null ? "" : ev.title;
                     ce.location = ev.location == null ? "" : ev.location;

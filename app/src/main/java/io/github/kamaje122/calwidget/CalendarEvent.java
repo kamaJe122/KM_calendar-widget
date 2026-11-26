@@ -17,6 +17,7 @@ public final class CalendarEvent {
 
     public static final String EXTRA_HAS_EVENT = "km_has_event";
     public static final String EXTRA_EVENT_ID = "km_event_id";
+    public static final String EXTRA_NOTION_PAGE_ID = "km_notion_page_id";
     public static final String EXTRA_SOURCE_KEY = "km_source_key";
     public static final String EXTRA_TITLE = "km_title";
     public static final String EXTRA_LOCATION = "km_location";
@@ -34,6 +35,7 @@ public final class CalendarEvent {
     public static final String EXTRA_HAS_EXPLICIT_END = "km_has_explicit_end";
 
     public long eventId = -1L;
+    public String notionPageId = "";
     public String sourceKey = "";
     public String title = "";
     public String location = "";
@@ -51,7 +53,9 @@ public final class CalendarEvent {
     public boolean hasExplicitEnd = true;
 
     public boolean isNotion() {
-        return !TextUtils.isEmpty(notionUrl) || (sourceKey != null && sourceKey.startsWith("notion:"));
+        return !TextUtils.isEmpty(notionPageId)
+                || !TextUtils.isEmpty(notionUrl)
+                || (sourceKey != null && sourceKey.startsWith("notion:"));
     }
 
     public boolean isMultiDay() {
@@ -102,6 +106,7 @@ public final class CalendarEvent {
     public void writeToIntent(Intent intent) {
         intent.putExtra(EXTRA_HAS_EVENT, true)
                 .putExtra(EXTRA_EVENT_ID, eventId)
+                .putExtra(EXTRA_NOTION_PAGE_ID, notionPageId)
                 .putExtra(EXTRA_SOURCE_KEY, sourceKey)
                 .putExtra(EXTRA_TITLE, title)
                 .putExtra(EXTRA_LOCATION, location)
@@ -125,6 +130,7 @@ public final class CalendarEvent {
         }
         CalendarEvent ev = new CalendarEvent();
         ev.eventId = intent.getLongExtra(EXTRA_EVENT_ID, -1L);
+        ev.notionPageId = nonNull(intent.getStringExtra(EXTRA_NOTION_PAGE_ID));
         ev.sourceKey = nonNull(intent.getStringExtra(EXTRA_SOURCE_KEY));
         ev.title = nonNull(intent.getStringExtra(EXTRA_TITLE));
         ev.location = nonNull(intent.getStringExtra(EXTRA_LOCATION));
