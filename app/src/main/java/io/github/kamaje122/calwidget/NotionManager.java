@@ -1016,8 +1016,14 @@ public final class NotionManager {
 
             CalendarWidgetProvider.Event ev = new CalendarWidgetProvider.Event();
             ev.eventId = -1L;
+            ev.sourceKey = nev.sourceKey;
             ev.notionUrl = nev.notionUrl;
             ev.allDay = nev.allDay;
+            ev.startEpochDay = nev.startEpochDay;
+            ev.endEpochDay = nev.endEpochDay;
+            ev.hasExplicitEnd = nev.hasExplicitEnd;
+            ev.calendarName = src.fullTitleWithIcon();
+            ev.statusLabel = nev.statusLabel == null ? "" : nev.statusLabel;
             ev.begin = nev.allDay ? dayStartMillis : nev.beginMillis;
             ev.end = nev.allDay ? dayEndMillis : nev.endMillis;
             ev.color = sourceColors.getOrDefault(nev.sourceKey, NOTION_PALETTE[0]);
@@ -1041,6 +1047,58 @@ public final class NotionManager {
             }
             ev.subtitle = sub.toString();
             out.add(ev);
+        }
+        return out;
+    }
+
+    /**
+     * Loads all Notion events intersecting [startDay, endDay] for the full Calendar App views.
+     */
+    public static List<CalendarEvent> loadAppEventsInRange(
+            Context context,
+            LocalDate startDay,
+            LocalDate endDay,
+            Set<String> hiddenCalendars) {
+        if (!hasToken(context)) return Collections.emptyList();
+        CachedWorkspace ws = loadCache(context);
+        if (ws == null || ws.events.isEmpty()) return Collections.emptyList();
+
+        Map<String, NotionSource> activeSources = new HashMap<>();
+        Map<String, Integer> sourceColors = new HashMap<>();
+        for (NotionSource s : ws.sources) {
+            if (hiddenCalendars == null || !hiddenCalendars.contains(s.sourceKey)) {
+                activeSources.put(s.sourceKey, s);
+                sourceColors.put(s.sourceKey, getSourceColor(context, s));
+            }
+        }
+        if (activeSources.isEmpty()) return Collections.emptyList();
+
+        long minEpoch = startDay.toEpochDay();
+        long maxEpoch = endDay.toEpochDay();
+        String accountLabel = "Notion · " + ws.workspaceName;
+        List<CalendarEvent> out = new ArrayList<>();
+
+        for (NotionCachedEvent nev : ws.events) {
+            NotionSource src = activeSources.get(nev.sourceKey);
+            if (src == null) continue;
+            if (nev.endEpochDay < minEpoch || nev.startEpochDay > maxEpoch) continue;
+
+            CalendarEvent ce = new CalendarEvent();
+            ce.eventId = -1L;
+            ce.sourceKey = nev.sourceKey;
+            ce.title = TextUtils.isEmpty(nev.title) ? context.getString(R.string.untitled) : nev.title;
+            ce.calendarName = src.fullTitleWithIcon();
+            ce.accountName = accountLabel;
+            ce.statusLabel = nev.statusLabel == null ? "" : nev.statusLabel;
+            ce.notionUrl = nev.notionUrl == null ? "" : nev.notionUrl;
+            ce.color = AppTheme.normalizePillColor(sourceColors.getOrDefault(nev.sourceKey, NOTION_PALETTE[0]));
+            ce.allDay = nev.allDay;
+            ce.startEpochDay = nev.startEpochDay;
+            ce.endEpochDay = Math.max(nev.startEpochDay, nev.endEpochDay);
+            ce.beginMillis = nev.beginMillis;
+            ce.endMillis = nev.endMillis;
+            ce.hasExplicitEnd = nev.hasExplicitEnd;
+            out.add(ce);
         }
         return out;
     }
@@ -1329,8 +1387,8 @@ public final class NotionManager {
         List<NotionCachedEvent> allEvents = new ArrayList<>();
         String lastWarning = "";
         ZoneId zone = ZoneId.systemDefault();
-        LocalDate minDay = LocalDate.now(zone).minusDays(45);
-        LocalDate maxDay = LocalDate.now(zone).plusDays(75);
+        LocalDate minDay = LocalDate.now(zone).minusDays(180);
+        LocalDate maxDay = LocalDate.now(zone).plusDays(270);
         String windowStart = minDay.toString();
         String windowEnd = maxDay.toString();
 

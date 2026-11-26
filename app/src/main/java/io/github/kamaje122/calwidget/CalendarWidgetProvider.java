@@ -82,12 +82,21 @@ public class CalendarWidgetProvider extends AppWidgetProvider {
 
     public static final class Event {
         long eventId = -1L;
-        String notionUrl;
-        String title;
-        String subtitle;
+        String sourceKey = "";
+        String notionUrl = "";
+        String title = "";
+        String subtitle = "";
+        String location = "";
+        String description = "";
+        String calendarName = "";
+        String accountName = "";
+        String statusLabel = "";
         long begin;
         long end;
+        long startEpochDay;
+        long endEpochDay;
         boolean allDay;
+        boolean hasExplicitEnd = true;
         int color;
     }
 
@@ -305,10 +314,13 @@ public class CalendarWidgetProvider extends AppWidgetProvider {
     }
 
     /**
-     * Returns true ONLY if every active widget AND the default profile hide this calendar key.
-     * Ensures NotionManager syncs any Notion source visible on at least one widget.
+     * Returns true ONLY if the main Calendar App, every active widget, AND the default profile
+     * all hide this calendar key.
      */
     public static boolean isHiddenInAllProfiles(Context context, String calendarKey) {
+        if (!AppPrefs.getAppHiddenCalendars(context).contains(calendarKey)) {
+            return false;
+        }
         if (!hiddenCalendars(context, PROFILE_DEFAULT).contains(calendarKey)) {
             return false;
         }
@@ -491,11 +503,10 @@ public class CalendarWidgetProvider extends AppWidgetProvider {
         views.setTextViewText(R.id.day_title, context.getString(R.string.day_title, selected.getDayOfMonth()));
 
         int reqBase = appWidgetId * 16;
-        long selectedStartMillis = selected.atStartOfDay(zone).toInstant().toEpochMilli();
-        Uri dayUri = ContentUris.withAppendedId(
-                CalendarContract.CONTENT_URI.buildUpon().appendPath("time").build(),
-                selectedStartMillis);
-        PendingIntent openDayIntent = activity(context, reqBase + 1, new Intent(Intent.ACTION_VIEW, dayUri));
+        Intent openDayApp = new Intent(context, MainActivity.class)
+                .setData(Uri.parse("calwidget://appday/" + appWidgetId + "/" + selected.toEpochDay()))
+                .putExtra(MainActivity.EXTRA_TARGET_EPOCH_DAY, selected.toEpochDay());
+        PendingIntent openDayIntent = activity(context, reqBase + 1, openDayApp);
 
         boolean hasCalPerm = context.checkSelfPermission(Manifest.permission.READ_CALENDAR)
                 == PackageManager.PERMISSION_GRANTED;
@@ -516,22 +527,19 @@ public class CalendarWidgetProvider extends AppWidgetProvider {
             views.setViewVisibility(R.id.agenda_list, View.GONE);
             views.setViewVisibility(R.id.empty, View.VISIBLE);
             views.setTextViewText(R.id.empty, context.getString(R.string.need_permission));
-            Intent cfgIntent = new Intent(context, MainActivity.class)
+            Intent cfgIntent = new Intent(context, WidgetConfigActivity.class)
                     .putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, appWidgetId);
-            PendingIntent openMain = activity(context, reqBase + 2, cfgIntent);
-            views.setOnClickPendingIntent(R.id.agenda, openMain);
-            views.setOnClickPendingIntent(R.id.day_header, openMain);
-            views.setOnClickPendingIntent(R.id.empty, openMain);
+            PendingIntent openCfg = activity(context, reqBase + 2, cfgIntent);
+            views.setOnClickPendingIntent(R.id.agenda, openCfg);
+            views.setOnClickPendingIntent(R.id.day_header, openCfg);
+            views.setOnClickPendingIntent(R.id.empty, openCfg);
         }
 
-        ZonedDateTime insertStart = selected.equals(today)
-                ? ZonedDateTime.now(zone).withMinute(0).withSecond(0).withNano(0).plusHours(1)
-                : selected.atTime(LocalTime.of(9, 0)).atZone(zone);
-        long insertBeginMillis = insertStart.toInstant().toEpochMilli();
-        Intent insertIntent = new Intent(Intent.ACTION_INSERT, CalendarContract.Events.CONTENT_URI)
-                .putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, insertBeginMillis)
-                .putExtra(CalendarContract.EXTRA_EVENT_END_TIME, insertBeginMillis + 3_600_000L);
-        views.setOnClickPendingIntent(R.id.add, activity(context, reqBase + 3, insertIntent));
+        Intent createInApp = new Intent(context, MainActivity.class)
+                .setData(Uri.parse("calwidget://appadd/" + appWidgetId + "/" + selected.toEpochDay()))
+                .putExtra(MainActivity.EXTRA_TARGET_EPOCH_DAY, selected.toEpochDay())
+                .putExtra(MainActivity.EXTRA_OPEN_CREATE_EVENT, true);
+        views.setOnClickPendingIntent(R.id.add, activity(context, reqBase + 3, createInApp));
 
         return views;
     }
@@ -549,7 +557,9 @@ public class CalendarWidgetProvider extends AppWidgetProvider {
         for (int offset = 0; offset < days; offset++) {
             LocalDate day = startDay.plusDays(offset);
             long dayMillis = day.atStartOfDay(zone).toInstant().toEpochMilli();
-            Intent dayFill = new Intent().putExtra(OpenActivity.EXTRA_DAY_MILLIS, dayMillis);
+            Intent dayFill = new Intent()
+                    .putExtra(OpenActivity.EXTRA_EPOCH_DAY, day.toEpochDay())
+                    .putExtra(OpenActivity.EXTRA_DAY_MILLIS, dayMillis);
 
             if (offset > 0) {
                 RemoteViews dayHeader = new RemoteViews(pkg, R.layout.widget_day_item);
@@ -574,14 +584,26 @@ public class CalendarWidgetProvider extends AppWidgetProvider {
                     row.setTextViewText(R.id.item_title, ev.title);
                     row.setTextViewText(R.id.item_time, ev.subtitle);
 
-                    Intent fill = new Intent();
-                    if (!TextUtils.isEmpty(ev.notionUrl)) {
-                        fill.putExtra(OpenActivity.EXTRA_NOTION_URL, ev.notionUrl);
-                    } else {
-                        fill.putExtra(OpenActivity.EXTRA_EVENT_ID, ev.eventId)
-                                .putExtra(OpenActivity.EXTRA_BEGIN, ev.begin)
-                                .putExtra(OpenActivity.EXTRA_END, ev.end);
-                    }
+                    CalendarEvent ce = new CalendarEvent();
+                    ce.eventId = ev.eventId;
+                    ce.sourceKey = ev.sourceKey == null ? "" : ev.sourceKey;
+                    ce.title = ev.title == null ? "" : ev.title;
+                    ce.location = ev.location == null ? "" : ev.location;
+                    ce.description = ev.description == null ? "" : ev.description;
+                    ce.calendarName = ev.calendarName == null ? "" : ev.calendarName;
+                    ce.accountName = ev.accountName == null ? "" : ev.accountName;
+                    ce.statusLabel = ev.statusLabel == null ? "" : ev.statusLabel;
+                    ce.notionUrl = ev.notionUrl == null ? "" : ev.notionUrl;
+                    ce.color = ev.color | 0xFF000000;
+                    ce.allDay = ev.allDay;
+                    ce.startEpochDay = ev.startEpochDay != 0 ? ev.startEpochDay : day.toEpochDay();
+                    ce.endEpochDay = ev.endEpochDay != 0 ? ev.endEpochDay : ce.startEpochDay;
+                    ce.beginMillis = ev.begin;
+                    ce.endMillis = ev.end;
+                    ce.hasExplicitEnd = ev.hasExplicitEnd;
+
+                    Intent fill = new Intent().putExtra(OpenActivity.EXTRA_EPOCH_DAY, day.toEpochDay());
+                    ce.writeToIntent(fill);
                     row.setOnClickFillInIntent(R.id.item_root, fill);
                     builder.addItem(itemId++, row);
                 }
@@ -612,6 +634,7 @@ public class CalendarWidgetProvider extends AppWidgetProvider {
         long dayStart = day.atStartOfDay(zone).toInstant().toEpochMilli();
         long dayEnd = day.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli();
         long julianDay = day.getLong(JulianFields.JULIAN_DAY);
+        long julian1970 = LocalDate.ofEpochDay(0).getLong(JulianFields.JULIAN_DAY);
         long nowMillis = System.currentTimeMillis();
         boolean includeAllDay = showAllDay(context, appWidgetId);
         Set<String> hidden = hiddenCalendars(context, appWidgetId);
@@ -633,7 +656,10 @@ public class CalendarWidgetProvider extends AppWidgetProvider {
                     CalendarContract.Instances.EVENT_LOCATION,
                     CalendarContract.Instances.DISPLAY_COLOR,
                     CalendarContract.Instances.SELF_ATTENDEE_STATUS,
-                    CalendarContract.Instances.CALENDAR_ID
+                    CalendarContract.Instances.CALENDAR_ID,
+                    CalendarContract.Instances.DESCRIPTION,
+                    CalendarContract.Instances.CALENDAR_DISPLAY_NAME,
+                    CalendarContract.Calendars.ACCOUNT_NAME
             };
 
             try (Cursor c = context.getContentResolver().query(
@@ -648,36 +674,49 @@ public class CalendarWidgetProvider extends AppWidgetProvider {
                             continue;
                         }
                         long calId = c.getLong(10);
-                        if (hidden.contains(String.valueOf(calId))) {
+                        String calKey = String.valueOf(calId);
+                        if (hidden.contains(calKey)) {
                             continue;
                         }
 
                         Event ev = new Event();
                         ev.eventId = c.getLong(0);
+                        ev.sourceKey = calKey;
                         ev.begin = c.getLong(2);
                         ev.end = c.getLong(3);
                         ev.allDay = c.getInt(4) != 0;
 
                         if (ev.allDay) {
                             if (!includeAllDay) continue;
-                            if (c.getLong(5) > julianDay || c.getLong(6) < julianDay) continue;
+                            long sJul = c.getLong(5);
+                            long eJul = c.getLong(6);
+                            if (sJul > julianDay || eJul < julianDay) continue;
+                            ev.startEpochDay = sJul - julian1970;
+                            ev.endEpochDay = Math.max(ev.startEpochDay, eJul - julian1970);
                         } else {
                             boolean startsToday = ev.begin >= dayStart && ev.begin < dayEnd;
                             boolean spansToday = ev.begin < dayStart && ev.end > dayStart;
                             if (!startsToday && !spansToday) continue;
                             if (filterEndedToday && ev.end <= nowMillis && ev.end > ev.begin) continue;
+                            ev.startEpochDay = Instant.ofEpochMilli(ev.begin).atZone(zone).toLocalDate().toEpochDay();
+                            long adjEnd = ev.end > ev.begin ? (ev.end - 1L) : ev.begin;
+                            ev.endEpochDay = Math.max(ev.startEpochDay,
+                                    Instant.ofEpochMilli(adjEnd).atZone(zone).toLocalDate().toEpochDay());
                         }
 
                         String rawTitle = c.getString(1);
                         ev.title = TextUtils.isEmpty(rawTitle) ? context.getString(R.string.untitled) : rawTitle;
                         ev.color = c.getInt(8);
+                        ev.location = c.getString(7) == null ? "" : c.getString(7);
+                        ev.description = c.getString(11) == null ? "" : c.getString(11);
+                        ev.calendarName = c.getString(12) == null ? "" : c.getString(12);
+                        ev.accountName = c.getString(13) == null ? "" : c.getString(13);
 
                         String timePart = ev.allDay
                                 ? context.getString(R.string.all_day)
                                 : (hm(ev.begin, zone) + "–" + hm(ev.end, zone));
-                        String loc = c.getString(7);
-                        if (!TextUtils.isEmpty(loc)) {
-                            ev.subtitle = timePart + " · " + loc.trim();
+                        if (!TextUtils.isEmpty(ev.location)) {
+                            ev.subtitle = timePart + " · " + ev.location.trim();
                         } else {
                             ev.subtitle = timePart;
                         }

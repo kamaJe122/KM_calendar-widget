@@ -1,23 +1,22 @@
 package io.github.kamaje122.calwidget;
 
 import android.Manifest;
-import android.accounts.Account;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.appwidget.AppWidgetManager;
-import android.content.ComponentName;
-import android.content.ContentResolver;
-import android.content.ContentUris;
-import android.content.ContentValues;
 import android.content.Intent;
 import android.content.pm.PackageManager;
-import android.database.Cursor;
+import android.content.res.ColorStateList;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
-import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
-import android.provider.CalendarContract;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.SpannableString;
 import android.text.Spanned;
 import android.text.TextUtils;
@@ -25,191 +24,156 @@ import android.text.style.ForegroundColorSpan;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.Window;
+import android.view.WindowInsetsController;
 import android.widget.Button;
 import android.widget.CheckBox;
-import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
-import android.widget.ProgressBar;
-import android.widget.Switch;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.io.File;
-import java.time.Instant;
-import java.time.ZoneId;
-import java.time.format.DateTimeFormatter;
+import java.time.DayOfWeek;
+import java.time.LocalDate;
+import java.time.YearMonth;
+import java.time.temporal.TemporalAdjusters;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
+/**
+ * Main Google-Calendar-inspired Calendar App ("KM 行事曆"):
+ * - Supports 5 switchable views: 時間表 (Schedule), 天 (1-Day), 3 天 (3-Day), 週 (Week), 月 (Month)
+ * - Traditional Chinese Lunar dates & sexagenary year/month subtitle ("丙午年九月 - 十月")
+ * - Slide-out Left Navigation Drawer with Google + Notion calendar checkboxes, theme & week-start toggles
+ * - Deep-links seamlessly with Desktop Widgets & WidgetConfigActivity
+ */
 public class MainActivity extends Activity {
 
-    private static final int REQUEST_CALENDAR = 1;
-    private static final String[] CALENDAR_PERMISSIONS = new String[]{
+    public static final String EXTRA_TARGET_EPOCH_DAY = "km_target_epoch_day";
+    public static final String EXTRA_OPEN_CREATE_EVENT = "km_open_create_event";
+
+    private static final int REQ_PERMISSIONS = 201;
+    private static final String[] CALENDAR_PERMS = {
             Manifest.permission.READ_CALENDAR,
             Manifest.permission.WRITE_CALENDAR
     };
-    private static final String NOTION_INTEGRATIONS_URL = "https://www.notion.so/profile/integrations";
-    private static final String GITHUB_REPO_URL = "https://github.com/" + AppUpdater.DEFAULT_GITHUB_REPO;
 
-    private boolean askedOnce;
-    private int configureWidgetId = AppWidgetManager.INVALID_APPWIDGET_ID;
-    private int editingProfileId = -1;
-    private boolean updatingControlsProgrammatically;
+    private final ExecutorService dataExecutor = Executors.newSingleThreadExecutor();
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private int loadGeneration = 0;
 
-    private LinearLayout configBannerCard;
-    private TextView configBannerText;
+    private AppTheme.Palette palette;
+    private int viewMode;
+    private LocalDate anchorDate = LocalDate.now();
+    private boolean hasAvailableUpdate = false;
 
-    private TextView status;
-    private Button grant;
-    private LinearLayout calendars;
+    // Root & Shell Views
+    private SlideDrawerLayout drawerLayout;
+    private LinearLayout mainRoot;
+    private LinearLayout topBar;
+    private TextView topMonthTitle;
+    private TextView topLunarSubtitle;
+    private TodayBadgeIconView todayBadgeBtn;
+    private SettingsBadgeIconView settingsBadgeBtn;
+    private LinearLayout permissionBanner;
+    private FrameLayout viewportFrame;
+    private View fabPlus;
 
-    // Per-Widget Selector Views
-    private LinearLayout widgetTabs;
-    private TextView editingTargetLabel;
-    private Button btnRenameWidget;
-    private Button btnCopyToAll;
-    private Switch switchAllDay;
-    private TextView daysValue;
-    private TextView sectionDisplayTitle;
-    private TextView sectionCalendarsTitle;
+    // Calendar Views
+    private MonthCalendarView monthView;
+    private MultiDayTimelineView timelineView;
+    private ScheduleAgendaView scheduleView;
 
-    // GitHub OTA Updater Views
-    private TextView updateStatus;
-    private ProgressBar updateProgress;
-    private Button btnCheckUpdate;
-    private Button btnDownloadUpdate;
-    private AppUpdater.ReleaseInfo latestRelease;
-    private File pendingInstallApk;
+    // Drawer Views
+    private ScrollView drawerScroll;
+    private LinearLayout drawerContent;
 
-    // Notion Views
-    private EditText inputNotionToken;
-    private Button btnNotionSync;
-    private Button btnNotionClear;
-    private Button btnNotionAddUrl;
-    private Button btnNotionAddCustom;
-    private TextView notionStatus;
+    private final CalendarDialogs.Callbacks dialogCallbacks = new CalendarDialogs.Callbacks() {
+        @Override
+        public void onJumpToDateAndView(LocalDate date, int optionalViewMode) {
+            anchorDate = date;
+            if (optionalViewMode >= AppPrefs.VIEW_SCHEDULE && optionalViewMode <= AppPrefs.VIEW_MONTH) {
+                viewMode = optionalViewMode;
+                AppPrefs.setViewMode(MainActivity.this, viewMode);
+                rebuildDrawerContent();
+            }
+            if (timelineView != null) {
+                timelineView.scrollToDefaultHour();
+            }
+            reloadCalendarData();
+        }
+
+        @Override
+        public void onEventsMutated() {
+            reloadCalendarData();
+        }
+
+        @Override
+        public void onRequestWritePermission() {
+            requestPermissions(CALENDAR_PERMS, REQ_PERMISSIONS);
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        setContentView(R.layout.activity_main);
 
-        TextView versionBadge = findViewById(R.id.version_badge);
-        versionBadge.setText(String.format(Locale.US, "v%s (Build %d) · %s",
-                AppUpdater.getCurrentVersionName(this),
-                AppUpdater.getCurrentVersionCode(this),
-                AppUpdater.DEFAULT_GITHUB_REPO));
+        // Forward legacy launcher APPWIDGET_CONFIGURE intents cleanly to WidgetConfigActivity
+        Intent launchIntent = getIntent();
+        if (launchIntent != null && AppWidgetManager.ACTION_APPWIDGET_CONFIGURE.equals(launchIntent.getAction())) {
+            Intent fwd = new Intent(this, WidgetConfigActivity.class);
+            fwd.putExtras(launchIntent);
+            fwd.addFlags(Intent.FLAG_ACTIVITY_FORWARD_RESULT);
+            startActivity(fwd);
+            finish();
+            return;
+        }
 
-        configBannerCard = findViewById(R.id.config_banner_card);
-        configBannerText = findViewById(R.id.config_banner_text);
-        findViewById(R.id.btn_finish_configure).setOnClickListener(v -> finishWidgetConfiguration());
+        viewMode = AppPrefs.getViewMode(this);
+        palette = AppTheme.of(this);
 
-        // Updater UI
-        updateStatus = findViewById(R.id.update_status);
-        updateProgress = findViewById(R.id.update_progress);
-        btnCheckUpdate = findViewById(R.id.btn_check_update);
-        btnDownloadUpdate = findViewById(R.id.btn_download_update);
-        Button btnOpenGithub = findViewById(R.id.btn_open_github);
+        buildUiHierarchy();
+        applyThemeToShell();
+        handleIncomingDeepLink(launchIntent);
 
-        btnCheckUpdate.setOnClickListener(v -> checkForGithubUpdate(true));
-        btnDownloadUpdate.setOnClickListener(v -> startDownloadAndInstall());
-        btnOpenGithub.setOnClickListener(v -> openUrl(GITHUB_REPO_URL));
+        if (!CalendarDataRepository.hasReadPermission(this)) {
+            requestPermissions(CALENDAR_PERMS, REQ_PERMISSIONS);
+        }
 
-        // System Calendar & Pin UI
-        status = findViewById(R.id.status);
-        grant = findViewById(R.id.btn_grant);
-        calendars = findViewById(R.id.calendars);
+        // Silent check for GitHub update badge on ⚙️ icon
+        AppUpdater.checkLatestRelease(this, new AppUpdater.CheckCallback() {
+            @Override
+            public void onSuccess(AppUpdater.ReleaseInfo info) {
+                hasAvailableUpdate = info.hasNewerUpdate;
+                if (settingsBadgeBtn != null) {
+                    settingsBadgeBtn.setShowDot(hasAvailableUpdate);
+                }
+            }
 
-        grant.setOnClickListener(v -> {
-            if (askedOnce && !shouldShowRequestPermissionRationale(Manifest.permission.READ_CALENDAR)) {
-                Intent settingsIntent = new Intent(
-                        android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                        Uri.fromParts("package", getPackageName(), null));
-                startActivity(settingsIntent);
-            } else {
-                requestPermissions(CALENDAR_PERMISSIONS, REQUEST_CALENDAR);
+            @Override
+            public void onError(String message) {
             }
         });
 
-        findViewById(R.id.btn_pin).setOnClickListener(v -> {
-            AppWidgetManager mgr = AppWidgetManager.getInstance(this);
-            if (mgr.isRequestPinAppWidgetSupported()) {
-                mgr.requestPinAppWidget(new ComponentName(this, CalendarWidgetProvider.class), null, null);
-            } else {
-                Toast.makeText(this, R.string.pin_unsupported, Toast.LENGTH_LONG).show();
-            }
-        });
-
-        // Notion UI
-        inputNotionToken = findViewById(R.id.input_notion_token);
-        btnNotionSync = findViewById(R.id.btn_notion_sync);
-        btnNotionClear = findViewById(R.id.btn_notion_clear);
-        btnNotionAddUrl = findViewById(R.id.btn_notion_add_url);
-        btnNotionAddCustom = findViewById(R.id.btn_notion_add_custom);
-        notionStatus = findViewById(R.id.notion_status);
-
-        inputNotionToken.setText(NotionManager.getToken(this));
-        findViewById(R.id.btn_notion_portal).setOnClickListener(v -> openUrl(NOTION_INTEGRATIONS_URL));
-        btnNotionSync.setOnClickListener(v -> handleNotionConnectAndSync());
-        btnNotionClear.setOnClickListener(v -> confirmClearNotion());
-        btnNotionAddUrl.setOnClickListener(v -> showAddNotionByUrlDialog());
-        btnNotionAddCustom.setOnClickListener(v -> showAddCustomNotionDialog());
-
-        // Per-Widget Selector & Scoped Display Controls
-        widgetTabs = findViewById(R.id.widget_tabs);
-        editingTargetLabel = findViewById(R.id.editing_target_label);
-        btnRenameWidget = findViewById(R.id.btn_rename_widget);
-        btnCopyToAll = findViewById(R.id.btn_copy_to_all);
-        sectionDisplayTitle = findViewById(R.id.section_display_title);
-        sectionCalendarsTitle = findViewById(R.id.section_calendars_title);
-
-        btnRenameWidget.setOnClickListener(v -> showRenameWidgetDialog());
-        btnCopyToAll.setOnClickListener(v -> confirmCopyToAllWidgets());
-
-        daysValue = findViewById(R.id.days_value);
-        View.OnClickListener daysClick = v -> {
-            int delta = (v.getId() == R.id.btn_days_plus) ? 1 : -1;
-            int current = CalendarWidgetProvider.daysToShow(this, editingProfileId);
-            CalendarWidgetProvider.setDaysToShow(this, editingProfileId, current + delta);
-            daysValue.setText(getString(R.string.days_value,
-                    CalendarWidgetProvider.daysToShow(this, editingProfileId)));
-            CalendarWidgetProvider.updateWidget(this, editingProfileId);
-            refreshWidgetSelectorTabs();
-        };
-        findViewById(R.id.btn_days_minus).setOnClickListener(daysClick);
-        findViewById(R.id.btn_days_plus).setOnClickListener(daysClick);
-
-        switchAllDay = findViewById(R.id.switch_all_day);
-        switchAllDay.setOnCheckedChangeListener((btn, checked) -> {
-            if (updatingControlsProgrammatically) return;
-            CalendarWidgetProvider.setShowAllDay(this, editingProfileId, checked);
-            CalendarWidgetProvider.updateWidget(this, editingProfileId);
-            refreshWidgetSelectorTabs();
-        });
-
-        applyConfigureIntent(getIntent());
-        checkForGithubUpdate(false);
-
-        // If Notion token is already configured but cached events are empty (e.g. upgrading from v2.0.0),
-        // automatically run a full discovery & sync immediately!
+        // Trigger background Notion refresh if connected
         if (NotionManager.hasToken(this)) {
-            NotionManager.CachedWorkspace ws = NotionManager.loadCache(this);
-            if (ws == null || ws.events.isEmpty()) {
-                notionStatus.setText("⏳ 正在自動重新同步 Notion 資料庫與月曆行程…");
-                NotionManager.scanWorkspaceAndSyncAsync(this, new NotionManager.SyncCallback() {
-                    @Override
-                    public void onSuccess(String workspaceName, int sourceCount, int eventCount) {
-                        refreshNotionUiState();
-                        showCalendars(hasCalPermission());
-                    }
+            NotionManager.refreshEventsOnlyAsync(this, 45_000L, new NotionManager.SyncCallback() {
+                @Override
+                public void onSuccess(String workspaceName, int sourceCount, int eventCount) {
+                    reloadCalendarData();
+                    rebuildDrawerContent();
+                }
 
-                    @Override
-                    public void onError(String errorMessage) {
-                        refreshNotionUiState();
-                    }
-                });
-            }
+                @Override
+                public void onError(String errorMessage) {
+                }
+            });
         }
     }
 
@@ -217,445 +181,592 @@ public class MainActivity extends Activity {
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
-        applyConfigureIntent(intent);
-        refresh();
-    }
-
-    private void applyConfigureIntent(Intent intent) {
-        int id = intent != null
-                ? intent.getIntExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, AppWidgetManager.INVALID_APPWIDGET_ID)
-                : AppWidgetManager.INVALID_APPWIDGET_ID;
-        if (id != AppWidgetManager.INVALID_APPWIDGET_ID && id > 0) {
-            configureWidgetId = id;
-            CalendarWidgetProvider.ensureWidgetInitialized(this, configureWidgetId);
-            editingProfileId = configureWidgetId;
-
-            Intent resultValue = new Intent().putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, configureWidgetId);
-            setResult(RESULT_OK, resultValue);
-
-            configBannerCard.setVisibility(View.VISIBLE);
-            configBannerText.setText("🎯 正在個別設定「"
-                    + CalendarWidgetProvider.getWidgetName(this, configureWidgetId)
-                    + "」\n下方調整的「顯示全天」、「顯示天數」與「勾選的日曆」，只會套用到這一個小工具！");
-        } else {
-            configBannerCard.setVisibility(View.GONE);
-            int[] activeIds = CalendarWidgetProvider.getActiveWidgetIds(this);
-            if (editingProfileId < 0) {
-                editingProfileId = activeIds.length > 0
-                        ? activeIds[0]
-                        : CalendarWidgetProvider.PROFILE_DEFAULT;
-            }
-        }
-    }
-
-    private void finishWidgetConfiguration() {
-        if (configureWidgetId > 0) {
-            CalendarWidgetProvider.updateWidget(this, configureWidgetId);
-            Intent resultValue = new Intent().putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, configureWidgetId);
-            setResult(RESULT_OK, resultValue);
-        } else {
-            CalendarWidgetProvider.updateAll(this);
-        }
-        finish();
+        handleIncomingDeepLink(intent);
+        reloadCalendarData();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        if (pendingInstallApk != null && pendingInstallApk.exists()
-                && getPackageManager().canRequestPackageInstalls()) {
-            File apk = pendingInstallApk;
-            pendingInstallApk = null;
-            AppUpdater.promptInstallApk(this, apk);
+        palette = AppTheme.of(this);
+        if (todayBadgeBtn != null) {
+            todayBadgeBtn.setDayNumber(LocalDate.now().getDayOfMonth());
         }
-        refresh();
+        applyThemeToShell();
+        rebuildDrawerContent();
+        reloadCalendarData();
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (drawerLayout != null && drawerLayout.isDrawerOpen()) {
+            drawerLayout.closeDrawer();
+            return;
+        }
+        super.onBackPressed();
     }
 
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        askedOnce = true;
-        refresh();
+        CalendarWidgetProvider.updateAll(this);
+        rebuildDrawerContent();
+        reloadCalendarData();
     }
 
-    private void refreshWidgetSelectorTabs() {
-        int[] activeIds = CalendarWidgetProvider.getActiveWidgetIds(this);
-        boolean validCurrent = (editingProfileId == CalendarWidgetProvider.PROFILE_DEFAULT);
-        for (int id : activeIds) {
-            CalendarWidgetProvider.ensureWidgetInitialized(this, id);
-            if (id == editingProfileId) validCurrent = true;
-        }
-        if (!validCurrent) {
-            editingProfileId = activeIds.length > 0 ? activeIds[0] : CalendarWidgetProvider.PROFILE_DEFAULT;
+    private void handleIncomingDeepLink(Intent intent) {
+        if (intent == null) return;
+        if (intent.hasExtra(EXTRA_TARGET_EPOCH_DAY)) {
+            long epoch = intent.getLongExtra(EXTRA_TARGET_EPOCH_DAY, LocalDate.now().toEpochDay());
+            anchorDate = LocalDate.ofEpochDay(epoch);
+            intent.removeExtra(EXTRA_TARGET_EPOCH_DAY);
         }
 
-        widgetTabs.removeAllViews();
-        for (int id : activeIds) {
-            addWidgetTabPill(id, "📌 " + CalendarWidgetProvider.getWidgetName(this, id));
+        final CalendarEvent tappedEvent = CalendarEvent.fromIntent(intent);
+        if (tappedEvent != null) {
+            intent.removeExtra(CalendarEvent.EXTRA_HAS_EVENT);
+            mainHandler.post(() -> CalendarDialogs.showEventDetailDialog(
+                    this, tappedEvent, palette, dialogCallbacks));
+        } else if (intent.getBooleanExtra(EXTRA_OPEN_CREATE_EVENT, false)) {
+            intent.removeExtra(EXTRA_OPEN_CREATE_EVENT);
+            mainHandler.post(() -> CalendarDialogs.showCreateEventDialog(
+                    this, anchorDate, -1, palette, dialogCallbacks));
         }
-        addWidgetTabPill(CalendarWidgetProvider.PROFILE_DEFAULT, "⚙️ 預設模板");
-
-        String targetName = CalendarWidgetProvider.getWidgetName(this, editingProfileId);
-        boolean allDay = CalendarWidgetProvider.showAllDay(this, editingProfileId);
-        int days = CalendarWidgetProvider.daysToShow(this, editingProfileId);
-
-        editingTargetLabel.setText(String.format(Locale.TAIWAN,
-                "👉 目前正在調整：%s（全天：%s · 顯示 %d 天）",
-                targetName, allDay ? "開" : "關", days));
-        sectionDisplayTitle.setText(getString(R.string.section_display) + " — " + targetName);
-        sectionCalendarsTitle.setText(getString(R.string.section_calendars) + " — " + targetName);
-
-        btnRenameWidget.setEnabled(editingProfileId > 0);
-        btnCopyToAll.setVisibility(activeIds.length > 1 ? View.VISIBLE : View.GONE);
-
-        updatingControlsProgrammatically = true;
-        switchAllDay.setChecked(allDay);
-        daysValue.setText(getString(R.string.days_value, days));
-        updatingControlsProgrammatically = false;
     }
 
-    private void addWidgetTabPill(int profileId, String title) {
-        boolean selected = (profileId == editingProfileId);
-        TextView pill = new TextView(this);
-        pill.setText(title);
-        pill.setTextSize(14f);
-        pill.setTypeface(pill.getTypeface(), Typeface.BOLD);
-        pill.setPadding(dp(14), dp(8), dp(14), dp(8));
+    private void buildUiHierarchy() {
+        drawerLayout = new SlideDrawerLayout(this);
+        drawerLayout.setFitsSystemWindows(true);
 
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        lp.setMarginEnd(dp(8));
-        pill.setLayoutParams(lp);
+        // ================= MAIN CONTENT AREA =================
+        mainRoot = new LinearLayout(this);
+        mainRoot.setOrientation(LinearLayout.VERTICAL);
 
-        GradientDrawable bg = new GradientDrawable();
-        bg.setCornerRadius(dp(18));
-        int accentColor = getColor(R.color.accent);
-        if (selected) {
-            bg.setColor(accentColor);
-            pill.setTextColor(Color.WHITE);
+        // 1. Top App Bar (matches Google Calendar screenshot)
+        topBar = new LinearLayout(this);
+        topBar.setOrientation(LinearLayout.HORIZONTAL);
+        topBar.setGravity(Gravity.CENTER_VERTICAL);
+        topBar.setPadding(dp(8), dp(8), dp(10), dp(6));
+
+        HamburgerIconView menuBtn = new HamburgerIconView(this);
+        menuBtn.setContentDescription("開啟選單");
+        menuBtn.setOnClickListener(v -> drawerLayout.openDrawer());
+        topBar.addView(menuBtn, new LinearLayout.LayoutParams(dp(44), dp(44)));
+
+        LinearLayout titleCol = new LinearLayout(this);
+        titleCol.setOrientation(LinearLayout.VERTICAL);
+        titleCol.setPadding(dp(6), dp(2), dp(8), dp(2));
+        titleCol.setOnClickListener(v -> CalendarDialogs.showMonthYearPickerDialog(
+                this, YearMonth.from(anchorDate), palette, dialogCallbacks));
+
+        topMonthTitle = new TextView(this);
+        topMonthTitle.setTextSize(21f);
+        topMonthTitle.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+        topMonthTitle.setSingleLine(true);
+        titleCol.addView(topMonthTitle);
+
+        topLunarSubtitle = new TextView(this);
+        topLunarSubtitle.setTextSize(12f);
+        topLunarSubtitle.setSingleLine(true);
+        titleCol.addView(topLunarSubtitle);
+
+        topBar.addView(titleCol, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        // Search icon button
+        SearchIconView searchBtn = new SearchIconView(this);
+        searchBtn.setContentDescription("搜尋行程");
+        searchBtn.setOnClickListener(v -> CalendarDialogs.showSearchDialog(
+                this, AppPrefs.getAppHiddenCalendars(this), palette, dialogCallbacks));
+        topBar.addView(searchBtn, new LinearLayout.LayoutParams(dp(42), dp(42)));
+
+        // Today "[26]" icon button
+        todayBadgeBtn = new TodayBadgeIconView(this, LocalDate.now().getDayOfMonth());
+        todayBadgeBtn.setContentDescription("回到今天");
+        todayBadgeBtn.setOnClickListener(v -> {
+            anchorDate = LocalDate.now();
+            if (timelineView != null) {
+                timelineView.scrollToDefaultHour();
+            }
+            reloadCalendarData();
+        });
+        topBar.addView(todayBadgeBtn, new LinearLayout.LayoutParams(dp(42), dp(42)));
+
+        // Widget & Notion Settings button
+        settingsBadgeBtn = new SettingsBadgeIconView(this);
+        settingsBadgeBtn.setContentDescription("小工具、Notion 與更新設定");
+        settingsBadgeBtn.setOnClickListener(v ->
+                startActivity(new Intent(this, WidgetConfigActivity.class)));
+        topBar.addView(settingsBadgeBtn, new LinearLayout.LayoutParams(dp(42), dp(42)));
+
+        mainRoot.addView(topBar, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // 2. Optional Permission Onboarding Strip
+        permissionBanner = new LinearLayout(this);
+        permissionBanner.setOrientation(LinearLayout.HORIZONTAL);
+        permissionBanner.setGravity(Gravity.CENTER_VERTICAL);
+        permissionBanner.setPadding(dp(14), dp(8), dp(14), dp(8));
+        permissionBanner.setVisibility(View.GONE);
+
+        TextView permLabel = new TextView(this);
+        permLabel.setText("請授權系統行事曆或連接 Notion 以顯示行程");
+        permLabel.setTextSize(13f);
+        permissionBanner.addView(permLabel, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        Button permBtn = new Button(this);
+        permBtn.setText("授權／連接");
+        permBtn.setTextSize(12.5f);
+        permBtn.setAllCaps(false);
+        permBtn.setOnClickListener(v -> {
+            if (!CalendarDataRepository.hasReadPermission(this)) {
+                requestPermissions(CALENDAR_PERMS, REQ_PERMISSIONS);
+            } else {
+                startActivity(new Intent(this, WidgetConfigActivity.class));
+            }
+        });
+        permissionBanner.addView(permBtn);
+        mainRoot.addView(permissionBanner, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // 3. Viewport + Floating '+' Squircle Action Button
+        FrameLayout bodyOverlay = new FrameLayout(this);
+        viewportFrame = new FrameLayout(this);
+        bodyOverlay.addView(viewportFrame, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        monthView = new MonthCalendarView(this);
+        monthView.setListener(new MonthCalendarView.Listener() {
+            @Override
+            public void onDayClicked(LocalDate date, List<CalendarEvent> events) {
+                anchorDate = date;
+                CalendarDialogs.showDayOverviewDialog(MainActivity.this, date, events, palette, dialogCallbacks);
+            }
+
+            @Override
+            public void onMonthSwiped(int deltaMonths) {
+                YearMonth nextYm = YearMonth.from(anchorDate).plusMonths(deltaMonths);
+                int day = Math.min(anchorDate.getDayOfMonth(), nextYm.lengthOfMonth());
+                anchorDate = nextYm.atDay(day);
+                reloadCalendarData();
+            }
+        });
+
+        timelineView = new MultiDayTimelineView(this);
+        timelineView.setListener(new MultiDayTimelineView.Listener() {
+            @Override
+            public void onEventClicked(CalendarEvent event) {
+                CalendarDialogs.showEventDetailDialog(MainActivity.this, event, palette, dialogCallbacks);
+            }
+
+            @Override
+            public void onDayHeaderClicked(LocalDate date) {
+                anchorDate = date;
+                if (viewMode != AppPrefs.VIEW_DAY_1) {
+                    viewMode = AppPrefs.VIEW_DAY_1;
+                    AppPrefs.setViewMode(MainActivity.this, viewMode);
+                    rebuildDrawerContent();
+                    reloadCalendarData();
+                } else {
+                    CalendarDialogs.showCreateEventDialog(MainActivity.this, date, -1, palette, dialogCallbacks);
+                }
+            }
+
+            @Override
+            public void onEmptySlotClicked(LocalDate date, int hour) {
+                CalendarDialogs.showCreateEventDialog(MainActivity.this, date, hour, palette, dialogCallbacks);
+            }
+
+            @Override
+            public void onSwipePeriod(int deltaDays) {
+                anchorDate = anchorDate.plusDays(deltaDays);
+                reloadCalendarData();
+            }
+        });
+
+        scheduleView = new ScheduleAgendaView(this);
+        scheduleView.setListener(new ScheduleAgendaView.Listener() {
+            @Override
+            public void onEventClicked(CalendarEvent event) {
+                CalendarDialogs.showEventDetailDialog(MainActivity.this, event, palette, dialogCallbacks);
+            }
+
+            @Override
+            public void onEmptyDayClicked(LocalDate date) {
+                CalendarDialogs.showCreateEventDialog(MainActivity.this, date, -1, palette, dialogCallbacks);
+            }
+        });
+
+        fabPlus = new PlusSquircleFabView(this);
+        fabPlus.setContentDescription("新增行程");
+        fabPlus.setElevation(dp(6));
+        fabPlus.setOnClickListener(v ->
+                CalendarDialogs.showCreateEventDialog(this, anchorDate, -1, palette, dialogCallbacks));
+        FrameLayout.LayoutParams fabLp = new FrameLayout.LayoutParams(dp(56), dp(56), Gravity.BOTTOM | Gravity.END);
+        fabLp.setMargins(0, 0, dp(16), dp(18));
+        bodyOverlay.addView(fabPlus, fabLp);
+
+        mainRoot.addView(bodyOverlay, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        // ================= LEFT SLIDE-OUT NAVIGATION DRAWER =================
+        drawerScroll = new ScrollView(this);
+        drawerScroll.setVerticalScrollBarEnabled(false);
+        drawerContent = new LinearLayout(this);
+        drawerContent.setOrientation(LinearLayout.VERTICAL);
+        drawerContent.setPadding(dp(12), dp(16), dp(12), dp(28));
+        drawerScroll.addView(drawerContent);
+
+        int drawerW = Math.min(dp(312), Math.round(getResources().getDisplayMetrics().widthPixels * 0.84f));
+        drawerLayout.attachViews(mainRoot, drawerScroll, drawerW);
+
+        setContentView(drawerLayout);
+        rebuildDrawerContent();
+    }
+
+    private void applyThemeToShell() {
+        palette = AppTheme.of(this);
+        drawerLayout.setBackgroundColor(palette.bgAppBar);
+        mainRoot.setBackgroundColor(palette.bgCanvas);
+        topBar.setBackgroundColor(palette.bgAppBar);
+        topMonthTitle.setTextColor(palette.textPrimary);
+        topLunarSubtitle.setTextColor(palette.textSecondary);
+        drawerScroll.setBackgroundColor(palette.drawerBg);
+
+        for (int i = 0; i < topBar.getChildCount(); i++) {
+            topBar.getChildAt(i).invalidate();
+        }
+        if (fabPlus != null) {
+            fabPlus.invalidate();
+        }
+
+        Window win = getWindow();
+        if (win != null) {
+            win.setStatusBarColor(palette.bgAppBar);
+            win.setNavigationBarColor(palette.bgCanvas);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                WindowInsetsController wic = win.getInsetsController();
+                if (wic != null) {
+                    int lightMask = WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+                            | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
+                    wic.setSystemBarsAppearance(palette.isDark ? 0 : lightMask, lightMask);
+                }
+            }
+        }
+    }
+
+    private void reloadCalendarData() {
+        boolean hasPerm = CalendarDataRepository.hasReadPermission(this);
+        boolean hasNotion = NotionManager.hasToken(this);
+        permissionBanner.setVisibility((!hasPerm && !hasNotion) ? View.VISIBLE : View.GONE);
+        if (permissionBanner.getVisibility() == View.VISIBLE) {
+            permissionBanner.setBackgroundColor(palette.chipBg);
+            ((TextView) permissionBanner.getChildAt(0)).setTextColor(palette.textPrimary);
+        }
+
+        final int mode = viewMode;
+        final boolean startMonday = AppPrefs.isStartWeekOnMonday(this);
+        final DayOfWeek firstDow = startMonday ? DayOfWeek.MONDAY : DayOfWeek.SUNDAY;
+        final LocalDate anchor = anchorDate;
+        final AppTheme.Palette pal = palette;
+
+        // Update Top App Bar Month & Lunar Range Subtitle immediately
+        LocalDate lunarStart;
+        LocalDate lunarEnd;
+        LocalDate queryStart;
+        LocalDate queryEnd;
+
+        if (mode == AppPrefs.VIEW_MONTH) {
+            YearMonth ym = YearMonth.from(anchor);
+            lunarStart = ym.atDay(1);
+            lunarEnd = ym.atEndOfMonth();
+            queryStart = ym.atDay(1).with(TemporalAdjusters.previousOrSame(firstDow));
+            queryEnd = queryStart.plusDays(41);
+        } else if (mode == AppPrefs.VIEW_WEEK) {
+            queryStart = anchor.with(TemporalAdjusters.previousOrSame(firstDow));
+            queryEnd = queryStart.plusDays(6);
+            lunarStart = queryStart;
+            lunarEnd = queryEnd;
+        } else if (mode == AppPrefs.VIEW_DAY_3) {
+            queryStart = anchor;
+            queryEnd = anchor.plusDays(2);
+            lunarStart = queryStart;
+            lunarEnd = queryEnd;
+        } else if (mode == AppPrefs.VIEW_DAY_1) {
+            queryStart = anchor;
+            queryEnd = anchor;
+            lunarStart = anchor;
+            lunarEnd = anchor;
         } else {
-            bg.setColor(Color.TRANSPARENT);
-            bg.setStroke(dp(1), accentColor);
-            pill.setTextColor(getColor(R.color.text_primary));
+            // VIEW_SCHEDULE
+            lunarStart = anchor;
+            lunarEnd = anchor;
+            queryStart = anchor.minusDays(60);
+            queryEnd = anchor.plusDays(180);
         }
-        pill.setBackground(bg);
 
-        pill.setOnClickListener(v -> {
-            editingProfileId = profileId;
-            if (configureWidgetId > 0 && profileId > 0) {
-                configBannerText.setText("🎯 正在個別設定「"
-                        + CalendarWidgetProvider.getWidgetName(this, profileId) + "」");
-            }
-            refreshWidgetSelectorTabs();
-            showCalendars(hasCalPermission());
-        });
-        widgetTabs.addView(pill);
-    }
+        int curYear = LocalDate.now().getYear();
+        String monthText = (anchor.getYear() == curYear)
+                ? (anchor.getMonthValue() + "月 ▾")
+                : (anchor.getYear() + "年" + anchor.getMonthValue() + "月 ▾");
+        topMonthTitle.setText(monthText);
+        topLunarSubtitle.setText(LunarCalendarHelper.getRangeHeaderSubtitle(lunarStart, lunarEnd));
 
-    private void showRenameWidgetDialog() {
-        if (editingProfileId <= 0) return;
-        EditText input = new EditText(this);
-        input.setHint("例如：主桌面、工作 Notion、LockDock");
-        input.setText(CalendarWidgetProvider.getRawWidgetNickname(this, editingProfileId));
-        input.setSingleLine(true);
-        int pad = dp(20);
-        LinearLayout wrap = new LinearLayout(this);
-        wrap.setPadding(pad, dp(12), pad, 0);
-        wrap.addView(input, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        // Ensure correct active view in viewportFrame
+        View desiredView;
+        if (mode == AppPrefs.VIEW_MONTH) {
+            desiredView = monthView;
+        } else if (mode == AppPrefs.VIEW_SCHEDULE) {
+            desiredView = scheduleView;
+        } else {
+            desiredView = timelineView;
+        }
+        if (viewportFrame.getChildCount() != 1 || viewportFrame.getChildAt(0) != desiredView) {
+            viewportFrame.removeAllViews();
+            viewportFrame.addView(desiredView, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        }
 
-        new AlertDialog.Builder(this)
-                .setTitle("修改小工具 #" + editingProfileId + " 名稱")
-                .setMessage("取個好記的位置名稱，方便在多個小工具之間快速辨識與切換：")
-                .setView(wrap)
-                .setPositiveButton("儲存", (d, w) -> {
-                    CalendarWidgetProvider.setWidgetNickname(this, editingProfileId, input.getText().toString());
-                    refreshWidgetSelectorTabs();
-                })
-                .setNegativeButton("取消", null)
-                .show();
-    }
+        final int gen = ++loadGeneration;
+        final Set<String> hiddenKeys = AppPrefs.getAppHiddenCalendars(this);
+        final LocalDate fStart = queryStart;
+        final LocalDate fEnd = queryEnd;
 
-    private void confirmCopyToAllWidgets() {
-        String srcName = CalendarWidgetProvider.getWidgetName(this, editingProfileId);
-        new AlertDialog.Builder(this)
-                .setTitle("套用到所有小工具")
-                .setMessage("要把「" + srcName + "」的全天開關、顯示天數與勾選日曆，一併套用到手機上所有小工具嗎？")
-                .setPositiveButton("全部套用", (d, w) -> {
-                    CalendarWidgetProvider.copyProfileToAllWidgets(this, editingProfileId);
-                    Toast.makeText(this, "已套用到所有小工具", Toast.LENGTH_SHORT).show();
-                    refresh();
-                })
-                .setNegativeButton("取消", null)
-                .show();
-    }
+        dataExecutor.execute(() -> {
+            List<CalendarEvent> events = CalendarDataRepository.loadEventsInRange(
+                    getApplicationContext(), fStart, fEnd, hiddenKeys);
+            Map<Long, List<CalendarEvent>> grouped = (mode == AppPrefs.VIEW_MONTH || mode == AppPrefs.VIEW_SCHEDULE)
+                    ? CalendarDataRepository.groupEventsByEpochDay(events, fStart.toEpochDay(), fEnd.toEpochDay())
+                    : Collections.emptyMap();
 
-    private void checkForGithubUpdate(boolean userInitiated) {
-        btnCheckUpdate.setEnabled(false);
-        updateStatus.setText("⏳ 正在連線 GitHub Releases 檢查最新版本…");
-        AppUpdater.checkLatestRelease(this, new AppUpdater.CheckCallback() {
-            @Override
-            public void onSuccess(AppUpdater.ReleaseInfo info) {
-                btnCheckUpdate.setEnabled(true);
-                latestRelease = info;
-                String sizeMb = String.format(Locale.US, "%.2f MB", info.sizeBytes / (1024.0 * 1024.0));
-                if (info.hasNewerUpdate) {
-                    String notes = TextUtils.isEmpty(info.changelog) ? "" : ("\n更新內容：\n" + info.changelog);
-                    updateStatus.setText("🎉 發現新版本：" + info.title + " (" + sizeMb + ")" + notes);
-                    btnDownloadUpdate.setText(getString(R.string.btn_download_update));
-                    btnDownloadUpdate.setVisibility(View.VISIBLE);
+            mainHandler.post(() -> {
+                if (gen != loadGeneration || isFinishing()) return;
+                if (mode == AppPrefs.VIEW_MONTH) {
+                    monthView.setData(YearMonth.from(anchor), anchor, startMonday, pal, grouped);
+                } else if (mode == AppPrefs.VIEW_SCHEDULE) {
+                    scheduleView.setData(fStart, fEnd, anchor, startMonday, pal, grouped);
                 } else {
-                    updateStatus.setText("✅ 目前已是最新版本（GitHub 最新：" + info.cleanVersion + " · " + sizeMb + "）");
-                    if (userInitiated) {
-                        btnDownloadUpdate.setText("重新下載安裝");
-                        btnDownloadUpdate.setVisibility(View.VISIBLE);
-                    } else {
-                        btnDownloadUpdate.setVisibility(View.GONE);
+                    int cols = (mode == AppPrefs.VIEW_WEEK) ? 7 : (mode == AppPrefs.VIEW_DAY_3 ? 3 : 1);
+                    timelineView.setData(fStart, cols, pal, events);
+                }
+            });
+        });
+    }
+
+    private void rebuildDrawerContent() {
+        if (drawerContent == null) return;
+        drawerContent.removeAllViews();
+
+        // 1. Brand Header ("KM 行事曆" in Google multi-color accent)
+        LinearLayout brandRow = new LinearLayout(this);
+        brandRow.setOrientation(LinearLayout.HORIZONTAL);
+        brandRow.setGravity(Gravity.CENTER_VERTICAL);
+        brandRow.setPadding(dp(12), dp(6), dp(12), dp(12));
+
+        SpannableString brandSpan = new SpannableString("KM 行事曆");
+        brandSpan.setSpan(new ForegroundColorSpan(0xFF4285F4), 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        brandSpan.setSpan(new ForegroundColorSpan(0xFFEA4335), 1, 2, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        TextView brandTv = new TextView(this);
+        brandTv.setText(brandSpan);
+        brandTv.setTextSize(21f);
+        brandTv.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+        brandTv.setTextColor(palette.textPrimary);
+        brandRow.addView(brandTv, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        TextView verChip = new TextView(this);
+        verChip.setText("v" + AppUpdater.getCurrentVersionName(this));
+        verChip.setTextSize(11.5f);
+        verChip.setTextColor(palette.textSecondary);
+        brandRow.addView(verChip);
+        drawerContent.addView(brandRow);
+
+        // 2. 5 View Mode Items (matching Screenshot_20261126-152005.png)
+        addDrawerViewModeItem(AppPrefs.VIEW_SCHEDULE, "☰", "時間表");
+        addDrawerViewModeItem(AppPrefs.VIEW_DAY_1, "▣", "天");
+        addDrawerViewModeItem(AppPrefs.VIEW_DAY_3, "▥", "3 天");
+        addDrawerViewModeItem(AppPrefs.VIEW_WEEK, "▦", "週");
+        addDrawerViewModeItem(AppPrefs.VIEW_MONTH, "⊞", "月");
+
+        addDrawerDivider();
+
+        // 3. Refresh Action ("↻ 重新整理")
+        LinearLayout refreshRow = new LinearLayout(this);
+        refreshRow.setOrientation(LinearLayout.HORIZONTAL);
+        refreshRow.setGravity(Gravity.CENTER_VERTICAL);
+        refreshRow.setPadding(dp(14), dp(11), dp(14), dp(11));
+        refreshRow.setOnClickListener(v -> {
+            drawerLayout.closeDrawer();
+            Toast.makeText(this, "⏳ 正在重新同步 Google 與 Notion 行事曆…", Toast.LENGTH_SHORT).show();
+            CalendarWidgetProvider.requestSync(this, 0L);
+            if (NotionManager.hasToken(this)) {
+                NotionManager.refreshEventsOnlyAsync(this, 0L, new NotionManager.SyncCallback() {
+                    @Override
+                    public void onSuccess(String workspaceName, int sourceCount, int eventCount) {
+                        reloadCalendarData();
+                        rebuildDrawerContent();
+                        Toast.makeText(MainActivity.this,
+                                "✅ 已同步 Notion（" + eventCount + " 筆行程）", Toast.LENGTH_SHORT).show();
                     }
-                }
-            }
 
-            @Override
-            public void onError(String message) {
-                btnCheckUpdate.setEnabled(true);
-                updateStatus.setText("⚠️ " + message);
-                if (userInitiated) {
-                    Toast.makeText(MainActivity.this, message, Toast.LENGTH_SHORT).show();
-                }
+                    @Override
+                    public void onError(String errorMessage) {
+                        Toast.makeText(MainActivity.this, "⚠️ " + errorMessage, Toast.LENGTH_SHORT).show();
+                    }
+                });
+            } else {
+                reloadCalendarData();
             }
         });
-    }
+        TextView refIcon = new TextView(this);
+        refIcon.setText("↻");
+        refIcon.setTextSize(18f);
+        refIcon.setTypeface(Typeface.DEFAULT_BOLD);
+        refIcon.setTextColor(palette.textPrimary);
+        refIcon.setWidth(dp(34));
+        refreshRow.addView(refIcon);
 
-    private void startDownloadAndInstall() {
-        if (latestRelease == null || TextUtils.isEmpty(latestRelease.apkDownloadUrl)) return;
-        btnDownloadUpdate.setEnabled(false);
-        btnCheckUpdate.setEnabled(false);
-        updateProgress.setProgress(0);
-        updateProgress.setVisibility(View.VISIBLE);
-        updateStatus.setText("⬇️ 正在從 GitHub 下載更新檔… 0%");
+        TextView refLabel = new TextView(this);
+        refLabel.setText("重新整理");
+        refLabel.setTextSize(15f);
+        refLabel.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        refLabel.setTextColor(palette.textPrimary);
+        refreshRow.addView(refLabel);
+        drawerContent.addView(refreshRow);
 
-        AppUpdater.downloadApk(this, latestRelease.apkDownloadUrl, new AppUpdater.DownloadCallback() {
-            @Override
-            public void onProgress(int percent) {
-                updateProgress.setProgress(percent);
-                updateStatus.setText("⬇️ 正在從 GitHub 下載更新檔… " + percent + "%");
-            }
-
-            @Override
-            public void onReadyToInstall(File apkFile) {
-                btnDownloadUpdate.setEnabled(true);
-                btnCheckUpdate.setEnabled(true);
-                updateProgress.setVisibility(View.GONE);
-                boolean started = AppUpdater.promptInstallApk(MainActivity.this, apkFile);
-                if (started) {
-                    updateStatus.setText("✅ 下載完成，已開啟系統安裝程式！");
-                } else {
-                    pendingInstallApk = apkFile;
-                    updateStatus.setText("⚠️ 請在剛開啟的設定畫面開啟「允許安裝未知應用程式」，返回後將自動啟動安裝！");
-                }
-            }
-
-            @Override
-            public void onError(String message) {
-                btnDownloadUpdate.setEnabled(true);
-                btnCheckUpdate.setEnabled(true);
-                updateProgress.setVisibility(View.GONE);
-                updateStatus.setText("❌ " + message);
-                Toast.makeText(MainActivity.this, message, Toast.LENGTH_LONG).show();
-            }
+        // 4. Widget & Notion Settings Entry Card
+        LinearLayout widgetBtn = new LinearLayout(this);
+        widgetBtn.setOrientation(LinearLayout.VERTICAL);
+        widgetBtn.setPadding(dp(14), dp(10), dp(14), dp(10));
+        GradientDrawable wBg = new GradientDrawable();
+        wBg.setCornerRadius(dp(14));
+        wBg.setColor(palette.chipBg);
+        widgetBtn.setBackground(wBg);
+        LinearLayout.LayoutParams wLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        wLp.setMargins(dp(4), dp(4), dp(4), dp(8));
+        widgetBtn.setLayoutParams(wLp);
+        widgetBtn.setOnClickListener(v -> {
+            drawerLayout.closeDrawer();
+            startActivity(new Intent(this, WidgetConfigActivity.class));
         });
-    }
 
-    private void handleNotionConnectAndSync() {
-        String rawToken = inputNotionToken.getText().toString().trim();
-        if (rawToken.isEmpty()) {
-            Toast.makeText(this, "請先貼上 Notion Integration Secret Token", Toast.LENGTH_SHORT).show();
-            return;
-        }
-        NotionManager.saveToken(this, rawToken);
-        btnNotionSync.setEnabled(false);
-        btnNotionAddUrl.setVisibility(View.VISIBLE);
-        notionStatus.setText("⏳ 正在連接 Notion 並深度掃描工作區資料庫、檢視表與近期行程…");
+        TextView wTitle = new TextView(this);
+        wTitle.setText(hasAvailableUpdate
+                ? "⚙️ 桌面小工具 · Notion 串接（🎉 有新版可更新）"
+                : "⚙️ 桌面小工具設定 · Notion 串接 · 更新");
+        wTitle.setTextSize(13.8f);
+        wTitle.setTypeface(Typeface.DEFAULT_BOLD);
+        wTitle.setTextColor(palette.textPrimary);
+        widgetBtn.addView(wTitle);
 
-        NotionManager.scanWorkspaceAndSyncAsync(this, new NotionManager.SyncCallback() {
-            @Override
-            public void onSuccess(String workspaceName, int sourceCount, int eventCount) {
-                btnNotionSync.setEnabled(true);
-                refreshNotionUiState();
-                showCalendars(hasCalPermission());
-                if (sourceCount == 0) {
-                    notionStatus.setText("⚠️ 已連上「" + workspaceName
-                            + "」，但目前 0 個資料庫有開放給此 Integration！\n"
-                            + "👉 解決方法：點上方「取得 Notion Token ／ 設定 Access 權限」打開你的 Integration，切換到「Access（存取權限）」分頁勾選你的資料庫並按 Save，再回來按同步（或點下方「貼上資料庫連結／ID 加入」測試）！");
-                } else {
-                    Toast.makeText(MainActivity.this,
-                            "已同步「" + workspaceName + "」：" + sourceCount + " 個日曆檢視、共 " + eventCount + " 筆近期行程！",
-                            Toast.LENGTH_LONG).show();
+        TextView wSub = new TextView(this);
+        wSub.setText("管理各桌面小工具獨立設定、Notion 權限與 GitHub 更新");
+        wSub.setTextSize(11.5f);
+        wSub.setTextColor(palette.textSecondary);
+        widgetBtn.addView(wSub);
+        drawerContent.addView(widgetBtn);
+
+        addDrawerDivider();
+
+        // 5. Quick Theme & First-Day-Of-Week Segmented Switches
+        TextView prefHeader = new TextView(this);
+        prefHeader.setText("介面主題 ＆ 每週起始日");
+        prefHeader.setTextSize(12f);
+        prefHeader.setTypeface(Typeface.DEFAULT_BOLD);
+        prefHeader.setTextColor(palette.textSecondary);
+        prefHeader.setPadding(dp(10), dp(6), dp(10), dp(6));
+        drawerContent.addView(prefHeader);
+
+        int curTheme = AppPrefs.getThemeMode(this);
+        LinearLayout themeRow = new LinearLayout(this);
+        themeRow.setOrientation(LinearLayout.HORIZONTAL);
+        themeRow.setPadding(dp(6), 0, dp(6), dp(6));
+        addSegmentPill(themeRow, "淺色", curTheme == AppPrefs.THEME_LIGHT, () -> changeTheme(AppPrefs.THEME_LIGHT));
+        addSegmentPill(themeRow, "深色", curTheme == AppPrefs.THEME_DARK, () -> changeTheme(AppPrefs.THEME_DARK));
+        addSegmentPill(themeRow, "跟隨系統", curTheme == AppPrefs.THEME_SYSTEM, () -> changeTheme(AppPrefs.THEME_SYSTEM));
+        drawerContent.addView(themeRow);
+
+        boolean startMon = AppPrefs.isStartWeekOnMonday(this);
+        LinearLayout dowRow = new LinearLayout(this);
+        dowRow.setOrientation(LinearLayout.HORIZONTAL);
+        dowRow.setPadding(dp(6), 0, dp(6), dp(6));
+        addSegmentPill(dowRow, "週日起始", !startMon, () -> changeWeekStart(false));
+        addSegmentPill(dowRow, "週一起始", startMon, () -> changeWeekStart(true));
+        drawerContent.addView(dowRow);
+
+        addDrawerDivider();
+
+        // 6. Calendar Account Checkboxes (Notion + Google/System Accounts)
+        Set<String> appHidden = AppPrefs.getAppHiddenCalendars(this);
+
+        // 6A. Notion Workspace
+        if (NotionManager.hasToken(this)) {
+            NotionManager.CachedWorkspace ws = NotionManager.loadCache(this);
+            if (ws != null && !ws.sources.isEmpty()) {
+                addAccountSectionHeader("📓 " + ws.workspaceName, "Notion 日曆資料庫（點色塊可改色）");
+                for (NotionManager.NotionSource src : ws.sources) {
+                    int color = NotionManager.getSourceColor(this, src);
+                    boolean checked = !appHidden.contains(src.sourceKey);
+                    int count = ws.countEventsForSource(src.sourceKey);
+                    addDrawerCalendarCheckbox(
+                            src.fullTitleWithIcon() + " (" + count + ")",
+                            color,
+                            checked,
+                            isChecked -> {
+                                AppPrefs.setAppCalendarHidden(this, src.sourceKey, !isChecked);
+                                reloadCalendarData();
+                            },
+                            () -> showNotionColorPickerFromDrawer(src)
+                    );
                 }
+                addDrawerDivider();
             }
+        }
 
-            @Override
-            public void onError(String errorMessage) {
-                btnNotionSync.setEnabled(true);
-                notionStatus.setText("❌ " + errorMessage);
-                Toast.makeText(MainActivity.this, errorMessage, Toast.LENGTH_LONG).show();
+        // 6B. Google / System Calendars grouped by Account Email
+        List<CalendarDataRepository.SystemCalendarItem> sysCals =
+                CalendarDataRepository.loadSystemCalendars(this);
+        String currentAccount = null;
+        for (CalendarDataRepository.SystemCalendarItem cal : sysCals) {
+            if (!cal.accountName.equals(currentAccount)) {
+                if (currentAccount != null) {
+                    addDrawerDivider();
+                }
+                currentAccount = cal.accountName;
+                addAccountSectionHeader(
+                        currentAccount.isEmpty() ? "手機本機行事曆" : currentAccount,
+                        cal.accountType.contains("google") ? "Google" : "");
             }
-        });
-    }
-
-    private void showAddNotionByUrlDialog() {
-        String rawToken = inputNotionToken.getText().toString().trim();
-        if (!rawToken.isEmpty()) {
-            NotionManager.saveToken(this, rawToken);
+            String key = String.valueOf(cal.id);
+            boolean checked = cal.synced && !appHidden.contains(key);
+            addDrawerCalendarCheckbox(
+                    cal.displayName,
+                    cal.color,
+                    checked,
+                    isChecked -> {
+                        AppPrefs.setAppCalendarHidden(this, key, !isChecked);
+                        reloadCalendarData();
+                    },
+                    null
+            );
         }
-        EditText input = new EditText(this);
-        input.setHint("貼上 Notion 資料庫網址 (https://www.notion.so/...) 或 32 碼 ID");
-        input.setMaxLines(3);
-        int pad = dp(20);
-        LinearLayout wrap = new LinearLayout(this);
-        wrap.setPadding(pad, dp(12), pad, 0);
-        wrap.addView(input, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-
-        new AlertDialog.Builder(this)
-                .setTitle("手動貼上資料庫連結／ID")
-                .setMessage("若剛在 Notion 開啟權限但搜尋索引尚未更新，可在 Notion 資料庫點「Copy link」貼到下方直接加入：")
-                .setView(wrap)
-                .setPositiveButton("讀取並加入", (d, w) -> {
-                    String link = input.getText().toString().trim();
-                    if (link.isEmpty()) return;
-                    notionStatus.setText("⏳ 正在直接讀取指定的 Notion 資料庫與行程…");
-                    NotionManager.addDatabaseByUrlOrIdAsync(this, link, new NotionManager.SyncCallback() {
-                        @Override
-                        public void onSuccess(String workspaceName, int sourceCount, int eventCount) {
-                            refreshNotionUiState();
-                            showCalendars(hasCalPermission());
-                            Toast.makeText(MainActivity.this,
-                                    "成功加入資料庫！目前共快取 " + eventCount + " 筆行程",
-                                    Toast.LENGTH_LONG).show();
-                        }
-
-                        @Override
-                        public void onError(String errorMessage) {
-                            notionStatus.setText("❌ " + errorMessage);
-                            new AlertDialog.Builder(MainActivity.this)
-                                    .setTitle("無法讀取此 Notion 資料庫")
-                                    .setMessage(errorMessage)
-                                    .setPositiveButton("好", null)
-                                    .show();
-                        }
-                    });
-                })
-                .setNegativeButton("取消", null)
-                .show();
     }
 
-    private void confirmClearNotion() {
-        new AlertDialog.Builder(this)
-                .setTitle("中斷 Notion 連結")
-                .setMessage("確定要清除本機儲存的 Notion Token 與快取行程嗎？")
-                .setPositiveButton("中斷並清除", (d, w) -> {
-                    NotionManager.clearAccount(this);
-                    inputNotionToken.setText("");
-                    refresh();
-                })
-                .setNegativeButton("取消", null)
-                .show();
+    private void changeTheme(int nextTheme) {
+        AppPrefs.setThemeMode(this, nextTheme);
+        applyThemeToShell();
+        rebuildDrawerContent();
+        reloadCalendarData();
     }
 
-    private void showAddCustomNotionDialog() {
-        NotionManager.CachedWorkspace ws = NotionManager.loadCache(this);
-        if (ws == null || ws.databases.isEmpty()) {
-            Toast.makeText(this, "請先同步出至少一個 Notion 資料庫", Toast.LENGTH_SHORT).show();
-            return;
-        }
-        String[] dbNames = new String[ws.databases.size()];
-        for (int i = 0; i < ws.databases.size(); i++) {
-            NotionManager.NotionDatabaseMeta db = ws.databases.get(i);
-            dbNames[i] = (TextUtils.isEmpty(db.iconEmoji) ? "" : db.iconEmoji + " ") + db.title;
-        }
-        new AlertDialog.Builder(this)
-                .setTitle("選擇 Notion 資料庫")
-                .setItems(dbNames, (d1, dbIdx) -> promptViewForCustomNotion(ws.databases.get(dbIdx)))
-                .show();
+    private void changeWeekStart(boolean startMonday) {
+        AppPrefs.setStartWeekOnMonday(this, startMonday);
+        rebuildDrawerContent();
+        reloadCalendarData();
     }
 
-    private void promptViewForCustomNotion(NotionManager.NotionDatabaseMeta db) {
-        int viewCount = db.views.size();
-        String[] viewLabels = new String[viewCount + 1];
-        viewLabels[0] = "全部項目（不套用檢視表篩選）";
-        for (int i = 0; i < viewCount; i++) {
-            NotionManager.ViewOption v = db.views.get(i);
-            String vName = TextUtils.isEmpty(v.name) ? ("檢視 " + (i + 1)) : v.name;
-            viewLabels[i + 1] = vName + " [" + v.type + "]";
-        }
-        new AlertDialog.Builder(this)
-                .setTitle("選擇要套用的檢視篩選")
-                .setItems(viewLabels, (d2, viewChoice) -> {
-                    NotionManager.ViewOption chosenView = viewChoice == 0 ? null : db.views.get(viewChoice - 1);
-                    promptDatePropForCustomNotion(db, chosenView);
-                })
-                .show();
-    }
-
-    private void promptDatePropForCustomNotion(NotionManager.NotionDatabaseMeta db, NotionManager.ViewOption viewOrNull) {
-        if (db.dateProps.size() == 1) {
-            promptColorForCustomNotion(db, viewOrNull, db.dateProps.get(0));
-            return;
-        }
-        String[] propLabels = new String[db.dateProps.size()];
-        for (int i = 0; i < db.dateProps.size(); i++) {
-            NotionManager.DatePropOption p = db.dateProps.get(i);
-            propLabels[i] = p.name + ("date".equals(p.type) ? "" : " (" + p.type + ")");
-        }
-        new AlertDialog.Builder(this)
-                .setTitle("選擇日期欄位")
-                .setItems(propLabels, (d3, propIdx) ->
-                        promptColorForCustomNotion(db, viewOrNull, db.dateProps.get(propIdx)))
-                .show();
-    }
-
-    private void promptColorForCustomNotion(
-            NotionManager.NotionDatabaseMeta db,
-            NotionManager.ViewOption viewOrNull,
-            NotionManager.DatePropOption dateProp) {
-        CharSequence[] colorItems = buildColorMenuItems();
-        new AlertDialog.Builder(this)
-                .setTitle("選擇代表顏色")
-                .setItems(colorItems, (d4, colorIdx) -> {
-                    int color = NotionManager.NOTION_PALETTE[colorIdx];
-                    notionStatus.setText("⏳ 正在新增自訂檢視並同步行程…");
-                    NotionManager.addCustomSourceAndSync(this, db, viewOrNull, dateProp, color,
-                            new NotionManager.SyncCallback() {
-                                @Override
-                                public void onSuccess(String workspaceName, int sourceCount, int eventCount) {
-                                    refreshNotionUiState();
-                                    showCalendars(hasCalPermission());
-                                    Toast.makeText(MainActivity.this, "已新增自訂 Notion 日曆檢視！", Toast.LENGTH_SHORT).show();
-                                }
-
-                                @Override
-                                public void onError(String errorMessage) {
-                                    notionStatus.setText("❌ " + errorMessage);
-                                }
-                            });
-                })
-                .show();
-    }
-
-    private void showSourceColorPicker(NotionManager.NotionSource source) {
-        CharSequence[] items = buildColorMenuItems();
-        new AlertDialog.Builder(this)
-                .setTitle("自訂「" + source.displayName + "」代表色")
-                .setItems(items, (dialog, which) -> {
-                    NotionManager.setSourceColor(this, source.sourceKey, NotionManager.NOTION_PALETTE[which]);
-                    CalendarWidgetProvider.updateAll(this);
-                    showCalendars(hasCalPermission());
-                })
-                .show();
-    }
-
-    private CharSequence[] buildColorMenuItems() {
+    private void showNotionColorPickerFromDrawer(NotionManager.NotionSource src) {
         CharSequence[] items = new CharSequence[NotionManager.NOTION_PALETTE.length];
         for (int i = 0; i < NotionManager.NOTION_PALETTE.length; i++) {
             SpannableString s = new SpannableString("●  " + NotionManager.NOTION_PALETTE_NAMES[i]);
@@ -663,285 +774,317 @@ public class MainActivity extends Activity {
                     0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
             items[i] = s;
         }
-        return items;
+        new AlertDialog.Builder(this)
+                .setTitle("自訂「" + src.displayName + "」顏色")
+                .setItems(items, (d, which) -> {
+                    NotionManager.setSourceColor(this, src.sourceKey, NotionManager.NOTION_PALETTE[which]);
+                    CalendarWidgetProvider.updateAll(this);
+                    rebuildDrawerContent();
+                    reloadCalendarData();
+                })
+                .show();
     }
 
-    private boolean hasCalPermission() {
-        return checkSelfPermission(Manifest.permission.READ_CALENDAR) == PackageManager.PERMISSION_GRANTED;
-    }
+    private void addDrawerViewModeItem(int targetMode, String iconSymbol, String title) {
+        boolean active = (viewMode == targetMode);
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(16), dp(11), dp(16), dp(11));
 
-    private void refreshNotionUiState() {
-        boolean connected = NotionManager.hasToken(this);
-        btnNotionClear.setVisibility(connected ? View.VISIBLE : View.GONE);
-        btnNotionAddUrl.setVisibility(connected ? View.VISIBLE : View.GONE);
-        NotionManager.CachedWorkspace ws = NotionManager.loadCache(this);
-        if (!connected) {
-            notionStatus.setText("尚未連接 Notion（貼上 Token 後即可自動抓取你的 Notion 日曆）");
-            btnNotionAddCustom.setVisibility(View.GONE);
-        } else if (ws != null) {
-            long lastMs = NotionManager.getLastSyncMillis(this);
-            String timeStr = lastMs > 0
-                    ? Instant.ofEpochMilli(lastMs).atZone(ZoneId.systemDefault())
-                    .format(DateTimeFormatter.ofPattern("HH:mm"))
-                    : "--:--";
-            String base = String.format(Locale.TAIWAN,
-                    "✅ 已連結：%s（%d 個日曆檢視 · 共抓到 %d 筆近期行程 · 同步於 %s）",
-                    ws.workspaceName, ws.sources.size(), ws.events.size(), timeStr);
-            if (ws.sources.isEmpty()) {
-                base += "\n⚠️ 尚未抓到授權的資料庫！請點上方「設定 Access 權限」到 Notion Integration 的 Access 分頁勾選資料庫，或點下方「貼上資料庫連結／ID 加入」。";
-            } else if (!TextUtils.isEmpty(ws.diagnosticNote)) {
-                base += "\n⚠️ " + ws.diagnosticNote;
+        if (active) {
+            GradientDrawable pill = new GradientDrawable();
+            pill.setCornerRadius(dp(24));
+            pill.setColor(palette.drawerActivePill);
+            row.setBackground(pill);
+        }
+
+        TextView icon = new TextView(this);
+        icon.setText(iconSymbol);
+        icon.setTextSize(16f);
+        icon.setTypeface(Typeface.DEFAULT_BOLD);
+        icon.setTextColor(active ? palette.drawerActiveText : palette.textPrimary);
+        icon.setWidth(dp(34));
+        row.addView(icon);
+
+        TextView label = new TextView(this);
+        label.setText(title);
+        label.setTextSize(15f);
+        label.setTypeface(Typeface.create("sans-serif-medium", active ? Typeface.BOLD : Typeface.NORMAL));
+        label.setTextColor(active ? palette.drawerActiveText : palette.textPrimary);
+        row.addView(label);
+
+        row.setOnClickListener(v -> {
+            viewMode = targetMode;
+            AppPrefs.setViewMode(this, viewMode);
+            drawerLayout.closeDrawer();
+            rebuildDrawerContent();
+            if (timelineView != null) {
+                timelineView.scrollToDefaultHour();
             }
-            notionStatus.setText(base);
-            btnNotionAddCustom.setVisibility(ws.databases.isEmpty() ? View.GONE : View.VISIBLE);
-        } else {
-            notionStatus.setText("已儲存 Token，請點「連接並同步 Notion」進行掃描");
-            btnNotionAddCustom.setVisibility(View.GONE);
-        }
+            reloadCalendarData();
+        });
+
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.bottomMargin = dp(2);
+        drawerContent.addView(row, lp);
     }
 
-    private void refresh() {
-        boolean granted = hasCalPermission();
-        status.setText(granted ? R.string.status_granted : R.string.status_denied);
-        grant.setEnabled(!granted);
-        if (!granted && askedOnce && !shouldShowRequestPermissionRationale(Manifest.permission.READ_CALENDAR)) {
-            grant.setText(R.string.btn_open_settings);
-        } else {
-            grant.setText(R.string.btn_grant);
-        }
-
-        refreshWidgetSelectorTabs();
-        refreshNotionUiState();
-        showCalendars(granted);
-        CalendarWidgetProvider.requestSync(this, CalendarWidgetProvider.SYNC_ON_TOUCH_MS);
-        CalendarWidgetProvider.updateAll(this);
-    }
-
-    private void showCalendars(boolean hasSystemPermission) {
-        calendars.removeAllViews();
-        boolean hasNotion = NotionManager.hasToken(this);
-        NotionManager.CachedWorkspace notionWs = hasNotion ? NotionManager.loadCache(this) : null;
-        boolean hasNotionSources = notionWs != null && !notionWs.sources.isEmpty();
-
-        if (!hasSystemPermission && !hasNotionSources) {
-            calendars.addView(note(getString(R.string.calendars_need_permission)));
-            return;
-        }
-
-        final int targetProfileId = editingProfileId;
-        Set<String> hidden = CalendarWidgetProvider.hiddenCalendars(this, targetProfileId);
-        TextView summaryView = note("");
-        calendars.addView(summaryView);
-
-        int accountCount = 0;
-        int totalCalendars = 0;
-        int visibleCalendars = 0;
-
-        // 1. System / Google Calendars
-        if (hasSystemPermission) {
-            String[] proj = new String[]{
-                    CalendarContract.Calendars._ID,
-                    CalendarContract.Calendars.CALENDAR_DISPLAY_NAME,
-                    CalendarContract.Calendars.ACCOUNT_NAME,
-                    CalendarContract.Calendars.CALENDAR_COLOR,
-                    CalendarContract.Calendars.VISIBLE,
-                    CalendarContract.Calendars.SYNC_EVENTS,
-                    CalendarContract.Calendars.ACCOUNT_TYPE
-            };
-            String sort = CalendarContract.Calendars.ACCOUNT_NAME + " COLLATE NOCASE ASC, "
-                    + CalendarContract.Calendars.IS_PRIMARY + " DESC, "
-                    + CalendarContract.Calendars.CALENDAR_DISPLAY_NAME + " COLLATE NOCASE ASC";
-
-            String currentAccount = null;
-            try (Cursor c = getContentResolver().query(
-                    CalendarContract.Calendars.CONTENT_URI, proj, null, null, sort)) {
-                if (c != null) {
-                    while (c.moveToNext()) {
-                        long calId = c.getLong(0);
-                        String rawName = c.getString(1);
-                        String accName = c.getString(2);
-                        int color = c.getInt(3) | 0xFF000000;
-                        boolean synced = c.getInt(4) != 0 && c.getInt(5) != 0;
-                        String accType = c.getString(6);
-
-                        String displayName = TextUtils.isEmpty(rawName) ? getString(R.string.untitled) : rawName;
-                        String accountLabel = accName == null ? "" : accName;
-
-                        if (!accountLabel.equals(currentAccount)) {
-                            accountCount++;
-                            calendars.addView(accountHeader(accountLabel));
-                            currentAccount = accountLabel;
-                        }
-
-                        String labelText = synced ? displayName : getString(R.string.calendar_not_synced, displayName);
-                        SpannableString span = new SpannableString("● " + labelText);
-                        span.setSpan(new ForegroundColorSpan(color), 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-
-                        CheckBox cb = new CheckBox(this);
-                        cb.setText(span);
-                        cb.setTextSize(15f);
-                        cb.setMinHeight(dp(44));
-                        boolean isChecked = synced && !hidden.contains(String.valueOf(calId));
-                        cb.setChecked(isChecked);
-
-                        final boolean wasSynced = synced;
-                        cb.setOnCheckedChangeListener((btn, checked) -> {
-                            if (checked && !wasSynced) {
-                                boolean ok = enableSync(calId, accountLabel, accType);
-                                Toast.makeText(this,
-                                        getString(ok ? R.string.sync_requested : R.string.sync_failed, displayName),
-                                        Toast.LENGTH_LONG).show();
-                            }
-                            CalendarWidgetProvider.setCalendarHidden(this, targetProfileId, calId, !checked);
-                            CalendarWidgetProvider.updateWidget(this, targetProfileId);
-                            calendars.post(() -> showCalendars(hasCalPermission()));
-                        });
-                        calendars.addView(cb);
-
-                        totalCalendars++;
-                        if (isChecked) visibleCalendars++;
-                    }
-                }
-            } catch (SecurityException ignored) {
-            }
-        }
-
-        // 2. Notion Workspace Calendars & Views
-        if (hasNotionSources) {
-            accountCount++;
-            calendars.addView(accountHeader("Notion · " + notionWs.workspaceName));
-
-            List<NotionManager.NotionSource> sources = notionWs.sources;
-            for (NotionManager.NotionSource src : sources) {
-                int srcColor = NotionManager.getSourceColor(this, src);
-                boolean isChecked = !hidden.contains(src.sourceKey);
-                int evCount = notionWs.countEventsForSource(src.sourceKey);
-
-                LinearLayout row = new LinearLayout(this);
-                row.setOrientation(LinearLayout.HORIZONTAL);
-                row.setGravity(Gravity.CENTER_VERTICAL);
-                row.setMinimumHeight(dp(44));
-
-                View colorChip = new View(this);
-                LinearLayout.LayoutParams chipLp = new LinearLayout.LayoutParams(dp(22), dp(22));
-                chipLp.setMarginEnd(dp(8));
-                colorChip.setLayoutParams(chipLp);
-                GradientDrawable chipBg = new GradientDrawable();
-                chipBg.setShape(GradientDrawable.RECTANGLE);
-                chipBg.setCornerRadius(dp(6));
-                chipBg.setColor(srcColor);
-                colorChip.setBackground(chipBg);
-                colorChip.setContentDescription("修改代表色");
-                colorChip.setOnClickListener(v -> showSourceColorPicker(src));
-                row.addView(colorChip);
-
-                CheckBox cb = new CheckBox(this);
-                LinearLayout.LayoutParams cbLp = new LinearLayout.LayoutParams(
-                        0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-                cb.setLayoutParams(cbLp);
-                cb.setText(src.fullTitleWithIcon() + "（" + evCount + " 筆）");
-                cb.setTextSize(15f);
-                cb.setMinHeight(dp(44));
-                cb.setChecked(isChecked);
-                cb.setOnCheckedChangeListener((btn, checked) -> {
-                    CalendarWidgetProvider.setCalendarKeyHidden(this, targetProfileId, src.sourceKey, !checked);
-                    CalendarWidgetProvider.updateWidget(this, targetProfileId);
-                    if (checked && evCount == 0) {
-                        NotionManager.refreshEventsOnlyAsync(this, 0L, new NotionManager.SyncCallback() {
-                            @Override
-                            public void onSuccess(String workspaceName, int sourceCount, int eventCount) {
-                                refreshNotionUiState();
-                                showCalendars(hasCalPermission());
-                            }
-
-                            @Override
-                            public void onError(String errorMessage) {
-                            }
-                        });
-                    } else {
-                        calendars.post(() -> showCalendars(hasCalPermission()));
-                    }
-                });
-                row.addView(cb);
-
-                if (src.customAdded) {
-                    TextView removeBtn = new TextView(this);
-                    removeBtn.setText("✕");
-                    removeBtn.setTextSize(15f);
-                    removeBtn.setPadding(dp(10), dp(6), dp(6), dp(6));
-                    removeBtn.setOnClickListener(v -> {
-                        NotionManager.removeCustomSource(this, src.sourceKey);
-                        refreshNotionUiState();
-                        showCalendars(hasCalPermission());
-                    });
-                    row.addView(removeBtn);
-                }
-
-                calendars.addView(row);
-                totalCalendars++;
-                if (isChecked) visibleCalendars++;
-            }
-        }
-
-        if (totalCalendars == 0) {
-            summaryView.setText(R.string.calendars_none);
-        } else {
-            summaryView.setText(getString(R.string.calendar_summary,
-                    accountCount, totalCalendars, visibleCalendars));
-        }
-    }
-
-    private TextView accountHeader(String title) {
-        TextView tv = new TextView(this);
-        tv.setText(title);
-        tv.setTextSize(15f);
-        tv.setTypeface(tv.getTypeface(), Typeface.BOLD);
-        tv.setPadding(0, dp(14), 0, dp(2));
-        return tv;
-    }
-
-    private boolean enableSync(long calendarId, String accountName, String accountType) {
-        if (checkSelfPermission(Manifest.permission.WRITE_CALENDAR) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(CALENDAR_PERMISSIONS, REQUEST_CALENDAR);
-            return false;
-        }
-        try {
-            ContentValues cv = new ContentValues();
-            cv.put(CalendarContract.Calendars.SYNC_EVENTS, 1);
-            cv.put(CalendarContract.Calendars.VISIBLE, 1);
-            int rows = getContentResolver().update(
-                    ContentUris.withAppendedId(CalendarContract.Calendars.CONTENT_URI, calendarId),
-                    cv, null, null);
-            if (rows == 0) return false;
-            if (!TextUtils.isEmpty(accountName) && !TextUtils.isEmpty(accountType)) {
-                Bundle extras = new Bundle();
-                extras.putBoolean(ContentResolver.SYNC_EXTRAS_MANUAL, true);
-                extras.putBoolean(ContentResolver.SYNC_EXTRAS_EXPEDITED, true);
-                ContentResolver.requestSync(new Account(accountName, accountType),
-                        CalendarContract.AUTHORITY, extras);
-            }
-            return true;
-        } catch (RuntimeException e) {
-            return false;
-        }
-    }
-
-    private TextView note(String text) {
+    private void addSegmentPill(LinearLayout parent, String text, boolean active, Runnable onClick) {
         TextView tv = new TextView(this);
         tv.setText(text);
-        tv.setTextSize(14f);
-        tv.setTypeface(tv.getTypeface(), Typeface.BOLD);
-        return tv;
+        tv.setTextSize(12.5f);
+        tv.setTypeface(Typeface.DEFAULT_BOLD);
+        tv.setGravity(Gravity.CENTER);
+        tv.setPadding(dp(8), dp(7), dp(8), dp(7));
+
+        GradientDrawable bg = new GradientDrawable();
+        bg.setCornerRadius(dp(16));
+        bg.setColor(active ? palette.drawerActivePill : palette.chipBg);
+        tv.setBackground(bg);
+        tv.setTextColor(active ? palette.drawerActiveText : palette.textPrimary);
+        tv.setOnClickListener(v -> onClick.run());
+
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        lp.setMargins(dp(3), 0, dp(3), 0);
+        parent.addView(tv, lp);
     }
 
-    private void openUrl(String url) {
-        try {
-            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
-        } catch (Exception ignored) {
+    private void addAccountSectionHeader(String title, String subtitle) {
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setPadding(dp(12), dp(8), dp(12), dp(4));
+
+        TextView t = new TextView(this);
+        t.setText(title);
+        t.setTextSize(13.5f);
+        t.setTypeface(Typeface.DEFAULT_BOLD);
+        t.setTextColor(palette.textPrimary);
+        col.addView(t);
+
+        if (!TextUtils.isEmpty(subtitle)) {
+            TextView s = new TextView(this);
+            s.setText(subtitle);
+            s.setTextSize(11.5f);
+            s.setTextColor(palette.textSecondary);
+            col.addView(s);
+        }
+        drawerContent.addView(col);
+    }
+
+    private interface BoolConsumer {
+        void accept(boolean checked);
+    }
+
+    private void addDrawerCalendarCheckbox(
+            String label,
+            int color,
+            boolean checked,
+            BoolConsumer onToggle,
+            Runnable optionalColorClick) {
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(8), dp(2), dp(8), dp(2));
+
+        CheckBox cb = new CheckBox(this);
+        cb.setChecked(checked);
+        cb.setButtonTintList(ColorStateList.valueOf(color));
+        cb.setText(label);
+        cb.setTextSize(14f);
+        cb.setTextColor(palette.textPrimary);
+        cb.setMinHeight(dp(40));
+        cb.setOnCheckedChangeListener((b, isChecked) -> onToggle.accept(isChecked));
+        row.addView(cb, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        if (optionalColorClick != null) {
+            View dot = new View(this);
+            GradientDrawable bg = new GradientDrawable();
+            bg.setCornerRadius(dp(6));
+            bg.setColor(color);
+            dot.setBackground(bg);
+            LinearLayout.LayoutParams dLp = new LinearLayout.LayoutParams(dp(20), dp(20));
+            dLp.setMarginStart(dp(6));
+            dot.setLayoutParams(dLp);
+            dot.setOnClickListener(v -> optionalColorClick.run());
+            row.addView(dot);
+        }
+
+        drawerContent.addView(row);
+    }
+
+    private void addDrawerDivider() {
+        View div = new View(this);
+        div.setBackgroundColor(palette.divider);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(1));
+        lp.setMargins(dp(4), dp(8), dp(4), dp(8));
+        drawerContent.addView(div, lp);
+    }
+
+    // ==================== CRISP CUSTOM VECTOR ICON VIEWS ====================
+
+    private final class HamburgerIconView extends View {
+        private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+        HamburgerIconView(MainActivity ctx) {
+            super(ctx);
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeCap(Paint.Cap.ROUND);
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            float d = getResources().getDisplayMetrics().density;
+            p.setColor(palette.textPrimary);
+            p.setStrokeWidth(2.1f * d);
+            float cx = getWidth() * 0.5f;
+            float cy = getHeight() * 0.5f;
+            float hw = 9f * d;
+            canvas.drawLine(cx - hw, cy - 5.5f * d, cx + hw, cy - 5.5f * d, p);
+            canvas.drawLine(cx - hw, cy, cx + hw, cy, p);
+            canvas.drawLine(cx - hw, cy + 5.5f * d, cx + hw, cy + 5.5f * d, p);
+        }
+    }
+
+    private final class SearchIconView extends View {
+        private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+        SearchIconView(MainActivity ctx) {
+            super(ctx);
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeCap(Paint.Cap.ROUND);
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            float d = getResources().getDisplayMetrics().density;
+            p.setColor(palette.textPrimary);
+            p.setStrokeWidth(2.0f * d);
+            float cx = getWidth() * 0.46f;
+            float cy = getHeight() * 0.46f;
+            float r = 6.8f * d;
+            canvas.drawCircle(cx, cy, r, p);
+            canvas.drawLine(cx + r * 0.72f, cy + r * 0.72f, cx + 11.5f * d, cy + 11.5f * d, p);
+        }
+    }
+
+    private final class TodayBadgeIconView extends View {
+        private final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint text = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF box = new RectF();
+        private int dayNumber;
+
+        TodayBadgeIconView(MainActivity ctx, int day) {
+            super(ctx);
+            this.dayNumber = day;
+            stroke.setStyle(Paint.Style.STROKE);
+            text.setTextAlign(Paint.Align.CENTER);
+            text.setTypeface(Typeface.DEFAULT_BOLD);
+        }
+
+        void setDayNumber(int day) {
+            this.dayNumber = day;
+            invalidate();
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            float d = getResources().getDisplayMetrics().density;
+            float sd = getResources().getDisplayMetrics().scaledDensity;
+            float cx = getWidth() * 0.5f;
+            float cy = getHeight() * 0.5f;
+            float half = 9.5f * d;
+            box.set(cx - half, cy - half, cx + half, cy + half);
+
+            stroke.setColor(palette.textPrimary);
+            stroke.setStrokeWidth(1.9f * d);
+            canvas.drawRoundRect(box, 4f * d, 4f * d, stroke);
+
+            text.setColor(palette.textPrimary);
+            text.setTextSize(10.5f * sd);
+            Paint.FontMetrics fm = text.getFontMetrics();
+            float baseline = cy - (fm.ascent + fm.descent) * 0.5f + 0.5f * d;
+            canvas.drawText(String.valueOf(dayNumber), cx, baseline, text);
+        }
+    }
+
+    private final class SettingsBadgeIconView extends View {
+        private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint dotPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private boolean showDot = false;
+
+        SettingsBadgeIconView(MainActivity ctx) {
+            super(ctx);
+        }
+
+        void setShowDot(boolean show) {
+            this.showDot = show;
+            invalidate();
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            float d = getResources().getDisplayMetrics().density;
+            float cx = getWidth() * 0.5f;
+            float cy = getHeight() * 0.5f;
+
+            p.setColor(palette.textPrimary);
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeWidth(2.0f * d);
+            // Sliders / Tune icon for widget & Notion settings
+            float hw = 8.5f * d;
+            canvas.drawLine(cx - hw, cy - 5f * d, cx + hw, cy - 5f * d, p);
+            canvas.drawLine(cx - hw, cy + 5f * d, cx + hw, cy + 5f * d, p);
+            p.setStyle(Paint.Style.FILL);
+            canvas.drawCircle(cx - 3f * d, cy - 5f * d, 2.8f * d, p);
+            canvas.drawCircle(cx + 3.5f * d, cy + 5f * d, 2.8f * d, p);
+
+            if (showDot) {
+                dotPaint.setColor(0xFFEA4335);
+                canvas.drawCircle(cx + 8.5f * d, cy - 8.5f * d, 4f * d, dotPaint);
+            }
+        }
+    }
+
+    private final class PlusSquircleFabView extends View {
+        private final Paint bg = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint plus = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF rect = new RectF();
+
+        PlusSquircleFabView(MainActivity ctx) {
+            super(ctx);
+            plus.setStyle(Paint.Style.STROKE);
+            plus.setStrokeCap(Paint.Cap.ROUND);
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            float d = getResources().getDisplayMetrics().density;
+            rect.set(0, 0, getWidth(), getHeight());
+            bg.setColor(palette.fabBg);
+            canvas.drawRoundRect(rect, 16f * d, 16f * d, bg);
+
+            plus.setColor(palette.fabIcon);
+            plus.setStrokeWidth(2.5f * d);
+            float cx = getWidth() * 0.5f;
+            float cy = getHeight() * 0.5f;
+            float arm = 8.5f * d;
+            canvas.drawLine(cx - arm, cy, cx + arm, cy, plus);
+            canvas.drawLine(cx, cy - arm, cx, cy + arm, plus);
         }
     }
 
     private int dp(int v) {
         return Math.round(v * getResources().getDisplayMetrics().density);
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        dataExecutor.shutdownNow();
     }
 }

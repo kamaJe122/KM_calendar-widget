@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">KM 桌面行事曆小工具</string>
-    <string name="main_title">KM 桌面行事曆小工具</string>
-    <string name="main_intro">在桌面放一個或多個 5×2 的月曆＋行程小工具。\n支援「不同位置的小工具各自獨立設定（全天開關／天數／日曆清單）」，同時整合 Google 行事曆與 Notion 日曆資料庫。</string>
+    <string name="app_name">KM 行事曆</string>
+    <string name="main_title">小工具 · Notion · 更新設定</string>
+    <string name="main_intro">管理桌面 5×2 月曆＋行程小工具的「個別獨立設定（全天開關／天數／日曆清單）」、Notion 日曆資料庫串接，以及 GitHub App 內一鍵更新。</string>
 
     <string name="status_granted">✅ 已授權讀取系統行事曆</string>
     <string name="status_denied">⚠️ 尚未授權讀取系統行事曆（仍可單獨使用 Notion 日曆）</string>
