@@ -12,6 +12,7 @@ import android.content.ContentValues;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
+import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
@@ -52,9 +53,26 @@ public class MainActivity extends Activity {
     private static final String GITHUB_REPO_URL = "https://github.com/" + AppUpdater.DEFAULT_GITHUB_REPO;
 
     private boolean askedOnce;
+    private int configureWidgetId = AppWidgetManager.INVALID_APPWIDGET_ID;
+    private int editingProfileId = -1;
+    private boolean updatingControlsProgrammatically;
+
+    private LinearLayout configBannerCard;
+    private TextView configBannerText;
+
     private TextView status;
     private Button grant;
     private LinearLayout calendars;
+
+    // Per-Widget Selector Views
+    private LinearLayout widgetTabs;
+    private TextView editingTargetLabel;
+    private Button btnRenameWidget;
+    private Button btnCopyToAll;
+    private Switch switchAllDay;
+    private TextView daysValue;
+    private TextView sectionDisplayTitle;
+    private TextView sectionCalendarsTitle;
 
     // GitHub OTA Updater Views
     private TextView updateStatus;
@@ -68,6 +86,7 @@ public class MainActivity extends Activity {
     private EditText inputNotionToken;
     private Button btnNotionSync;
     private Button btnNotionClear;
+    private Button btnNotionAddUrl;
     private Button btnNotionAddCustom;
     private TextView notionStatus;
 
@@ -81,6 +100,10 @@ public class MainActivity extends Activity {
                 AppUpdater.getCurrentVersionName(this),
                 AppUpdater.getCurrentVersionCode(this),
                 AppUpdater.DEFAULT_GITHUB_REPO));
+
+        configBannerCard = findViewById(R.id.config_banner_card);
+        configBannerText = findViewById(R.id.config_banner_text);
+        findViewById(R.id.btn_finish_configure).setOnClickListener(v -> finishWidgetConfiguration());
 
         // Updater UI
         updateStatus = findViewById(R.id.update_status);
@@ -122,6 +145,7 @@ public class MainActivity extends Activity {
         inputNotionToken = findViewById(R.id.input_notion_token);
         btnNotionSync = findViewById(R.id.btn_notion_sync);
         btnNotionClear = findViewById(R.id.btn_notion_clear);
+        btnNotionAddUrl = findViewById(R.id.btn_notion_add_url);
         btnNotionAddCustom = findViewById(R.id.btn_notion_add_custom);
         notionStatus = findViewById(R.id.notion_status);
 
@@ -129,29 +153,110 @@ public class MainActivity extends Activity {
         findViewById(R.id.btn_notion_portal).setOnClickListener(v -> openUrl(NOTION_INTEGRATIONS_URL));
         btnNotionSync.setOnClickListener(v -> handleNotionConnectAndSync());
         btnNotionClear.setOnClickListener(v -> confirmClearNotion());
+        btnNotionAddUrl.setOnClickListener(v -> showAddNotionByUrlDialog());
         btnNotionAddCustom.setOnClickListener(v -> showAddCustomNotionDialog());
 
-        // Display Settings UI
-        TextView daysValue = findViewById(R.id.days_value);
-        daysValue.setText(getString(R.string.days_value, CalendarWidgetProvider.daysToShow(this)));
+        // Per-Widget Selector & Scoped Display Controls
+        widgetTabs = findViewById(R.id.widget_tabs);
+        editingTargetLabel = findViewById(R.id.editing_target_label);
+        btnRenameWidget = findViewById(R.id.btn_rename_widget);
+        btnCopyToAll = findViewById(R.id.btn_copy_to_all);
+        sectionDisplayTitle = findViewById(R.id.section_display_title);
+        sectionCalendarsTitle = findViewById(R.id.section_calendars_title);
+
+        btnRenameWidget.setOnClickListener(v -> showRenameWidgetDialog());
+        btnCopyToAll.setOnClickListener(v -> confirmCopyToAllWidgets());
+
+        daysValue = findViewById(R.id.days_value);
         View.OnClickListener daysClick = v -> {
             int delta = (v.getId() == R.id.btn_days_plus) ? 1 : -1;
-            CalendarWidgetProvider.setDaysToShow(this, CalendarWidgetProvider.daysToShow(this) + delta);
-            daysValue.setText(getString(R.string.days_value, CalendarWidgetProvider.daysToShow(this)));
-            CalendarWidgetProvider.updateAll(this);
+            int current = CalendarWidgetProvider.daysToShow(this, editingProfileId);
+            CalendarWidgetProvider.setDaysToShow(this, editingProfileId, current + delta);
+            daysValue.setText(getString(R.string.days_value,
+                    CalendarWidgetProvider.daysToShow(this, editingProfileId)));
+            CalendarWidgetProvider.updateWidget(this, editingProfileId);
+            refreshWidgetSelectorTabs();
         };
         findViewById(R.id.btn_days_minus).setOnClickListener(daysClick);
         findViewById(R.id.btn_days_plus).setOnClickListener(daysClick);
 
-        Switch switchAllDay = findViewById(R.id.switch_all_day);
-        switchAllDay.setChecked(CalendarWidgetProvider.showAllDay(this));
+        switchAllDay = findViewById(R.id.switch_all_day);
         switchAllDay.setOnCheckedChangeListener((btn, checked) -> {
-            CalendarWidgetProvider.setShowAllDay(this, checked);
-            CalendarWidgetProvider.updateAll(this);
+            if (updatingControlsProgrammatically) return;
+            CalendarWidgetProvider.setShowAllDay(this, editingProfileId, checked);
+            CalendarWidgetProvider.updateWidget(this, editingProfileId);
+            refreshWidgetSelectorTabs();
         });
 
-        // Auto-check GitHub update quietly on launch
+        applyConfigureIntent(getIntent());
         checkForGithubUpdate(false);
+
+        // If Notion token is already configured but cached events are empty (e.g. upgrading from v2.0.0),
+        // automatically run a full discovery & sync immediately!
+        if (NotionManager.hasToken(this)) {
+            NotionManager.CachedWorkspace ws = NotionManager.loadCache(this);
+            if (ws == null || ws.events.isEmpty()) {
+                notionStatus.setText("⏳ 正在自動重新同步 Notion 資料庫與月曆行程…");
+                NotionManager.scanWorkspaceAndSyncAsync(this, new NotionManager.SyncCallback() {
+                    @Override
+                    public void onSuccess(String workspaceName, int sourceCount, int eventCount) {
+                        refreshNotionUiState();
+                        showCalendars(hasCalPermission());
+                    }
+
+                    @Override
+                    public void onError(String errorMessage) {
+                        refreshNotionUiState();
+                    }
+                });
+            }
+        }
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        applyConfigureIntent(intent);
+        refresh();
+    }
+
+    private void applyConfigureIntent(Intent intent) {
+        int id = intent != null
+                ? intent.getIntExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, AppWidgetManager.INVALID_APPWIDGET_ID)
+                : AppWidgetManager.INVALID_APPWIDGET_ID;
+        if (id != AppWidgetManager.INVALID_APPWIDGET_ID && id > 0) {
+            configureWidgetId = id;
+            CalendarWidgetProvider.ensureWidgetInitialized(this, configureWidgetId);
+            editingProfileId = configureWidgetId;
+
+            Intent resultValue = new Intent().putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, configureWidgetId);
+            setResult(RESULT_OK, resultValue);
+
+            configBannerCard.setVisibility(View.VISIBLE);
+            configBannerText.setText("🎯 正在個別設定「"
+                    + CalendarWidgetProvider.getWidgetName(this, configureWidgetId)
+                    + "」\n下方調整的「顯示全天」、「顯示天數」與「勾選的日曆」，只會套用到這一個小工具！");
+        } else {
+            configBannerCard.setVisibility(View.GONE);
+            int[] activeIds = CalendarWidgetProvider.getActiveWidgetIds(this);
+            if (editingProfileId < 0) {
+                editingProfileId = activeIds.length > 0
+                        ? activeIds[0]
+                        : CalendarWidgetProvider.PROFILE_DEFAULT;
+            }
+        }
+    }
+
+    private void finishWidgetConfiguration() {
+        if (configureWidgetId > 0) {
+            CalendarWidgetProvider.updateWidget(this, configureWidgetId);
+            Intent resultValue = new Intent().putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, configureWidgetId);
+            setResult(RESULT_OK, resultValue);
+        } else {
+            CalendarWidgetProvider.updateAll(this);
+        }
+        finish();
     }
 
     @Override
@@ -171,6 +276,118 @@ public class MainActivity extends Activity {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         askedOnce = true;
         refresh();
+    }
+
+    private void refreshWidgetSelectorTabs() {
+        int[] activeIds = CalendarWidgetProvider.getActiveWidgetIds(this);
+        boolean validCurrent = (editingProfileId == CalendarWidgetProvider.PROFILE_DEFAULT);
+        for (int id : activeIds) {
+            CalendarWidgetProvider.ensureWidgetInitialized(this, id);
+            if (id == editingProfileId) validCurrent = true;
+        }
+        if (!validCurrent) {
+            editingProfileId = activeIds.length > 0 ? activeIds[0] : CalendarWidgetProvider.PROFILE_DEFAULT;
+        }
+
+        widgetTabs.removeAllViews();
+        for (int id : activeIds) {
+            addWidgetTabPill(id, "📌 " + CalendarWidgetProvider.getWidgetName(this, id));
+        }
+        addWidgetTabPill(CalendarWidgetProvider.PROFILE_DEFAULT, "⚙️ 預設模板");
+
+        String targetName = CalendarWidgetProvider.getWidgetName(this, editingProfileId);
+        boolean allDay = CalendarWidgetProvider.showAllDay(this, editingProfileId);
+        int days = CalendarWidgetProvider.daysToShow(this, editingProfileId);
+
+        editingTargetLabel.setText(String.format(Locale.TAIWAN,
+                "👉 目前正在調整：%s（全天：%s · 顯示 %d 天）",
+                targetName, allDay ? "開" : "關", days));
+        sectionDisplayTitle.setText(getString(R.string.section_display) + " — " + targetName);
+        sectionCalendarsTitle.setText(getString(R.string.section_calendars) + " — " + targetName);
+
+        btnRenameWidget.setEnabled(editingProfileId > 0);
+        btnCopyToAll.setVisibility(activeIds.length > 1 ? View.VISIBLE : View.GONE);
+
+        updatingControlsProgrammatically = true;
+        switchAllDay.setChecked(allDay);
+        daysValue.setText(getString(R.string.days_value, days));
+        updatingControlsProgrammatically = false;
+    }
+
+    private void addWidgetTabPill(int profileId, String title) {
+        boolean selected = (profileId == editingProfileId);
+        TextView pill = new TextView(this);
+        pill.setText(title);
+        pill.setTextSize(14f);
+        pill.setTypeface(pill.getTypeface(), Typeface.BOLD);
+        pill.setPadding(dp(14), dp(8), dp(14), dp(8));
+
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.setMarginEnd(dp(8));
+        pill.setLayoutParams(lp);
+
+        GradientDrawable bg = new GradientDrawable();
+        bg.setCornerRadius(dp(18));
+        int accentColor = getColor(R.color.accent);
+        if (selected) {
+            bg.setColor(accentColor);
+            pill.setTextColor(Color.WHITE);
+        } else {
+            bg.setColor(Color.TRANSPARENT);
+            bg.setStroke(dp(1), accentColor);
+            pill.setTextColor(getColor(R.color.text_primary));
+        }
+        pill.setBackground(bg);
+
+        pill.setOnClickListener(v -> {
+            editingProfileId = profileId;
+            if (configureWidgetId > 0 && profileId > 0) {
+                configBannerText.setText("🎯 正在個別設定「"
+                        + CalendarWidgetProvider.getWidgetName(this, profileId) + "」");
+            }
+            refreshWidgetSelectorTabs();
+            showCalendars(hasCalPermission());
+        });
+        widgetTabs.addView(pill);
+    }
+
+    private void showRenameWidgetDialog() {
+        if (editingProfileId <= 0) return;
+        EditText input = new EditText(this);
+        input.setHint("例如：主桌面、工作 Notion、LockDock");
+        input.setText(CalendarWidgetProvider.getRawWidgetNickname(this, editingProfileId));
+        input.setSingleLine(true);
+        int pad = dp(20);
+        LinearLayout wrap = new LinearLayout(this);
+        wrap.setPadding(pad, dp(12), pad, 0);
+        wrap.addView(input, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        new AlertDialog.Builder(this)
+                .setTitle("修改小工具 #" + editingProfileId + " 名稱")
+                .setMessage("取個好記的位置名稱，方便在多個小工具之間快速辨識與切換：")
+                .setView(wrap)
+                .setPositiveButton("儲存", (d, w) -> {
+                    CalendarWidgetProvider.setWidgetNickname(this, editingProfileId, input.getText().toString());
+                    refreshWidgetSelectorTabs();
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void confirmCopyToAllWidgets() {
+        String srcName = CalendarWidgetProvider.getWidgetName(this, editingProfileId);
+        new AlertDialog.Builder(this)
+                .setTitle("套用到所有小工具")
+                .setMessage("要把「" + srcName + "」的全天開關、顯示天數與勾選日曆，一併套用到手機上所有小工具嗎？")
+                .setPositiveButton("全部套用", (d, w) -> {
+                    CalendarWidgetProvider.copyProfileToAllWidgets(this, editingProfileId);
+                    Toast.makeText(this, "已套用到所有小工具", Toast.LENGTH_SHORT).show();
+                    refresh();
+                })
+                .setNegativeButton("取消", null)
+                .show();
     }
 
     private void checkForGithubUpdate(boolean userInitiated) {
@@ -257,7 +474,8 @@ public class MainActivity extends Activity {
         }
         NotionManager.saveToken(this, rawToken);
         btnNotionSync.setEnabled(false);
-        notionStatus.setText("⏳ 正在連接 Notion 並掃描所有授權資料庫與日曆／時間軸檢視…");
+        btnNotionAddUrl.setVisibility(View.VISIBLE);
+        notionStatus.setText("⏳ 正在連接 Notion 並深度掃描工作區資料庫、檢視表與近期行程…");
 
         NotionManager.scanWorkspaceAndSyncAsync(this, new NotionManager.SyncCallback() {
             @Override
@@ -267,11 +485,12 @@ public class MainActivity extends Activity {
                 showCalendars(hasCalPermission());
                 if (sourceCount == 0) {
                     notionStatus.setText("⚠️ 已連上「" + workspaceName
-                            + "」，但尚未找到授權的日曆資料庫。\n請到 Notion 打開你的日曆資料庫 → 右上角「•••」→「Connections（連結）」加入此 Integration 後再點一次同步！");
+                            + "」，但目前 0 個資料庫有開放給此 Integration！\n"
+                            + "👉 解決方法：點上方「取得 Notion Token ／ 設定 Access 權限」打開你的 Integration，切換到「Access（存取權限）」分頁勾選你的資料庫並按 Save，再回來按同步（或點下方「貼上資料庫連結／ID 加入」測試）！");
                 } else {
                     Toast.makeText(MainActivity.this,
-                            "已同步 Notion「" + workspaceName + "」：" + sourceCount + " 個日曆檢視",
-                            Toast.LENGTH_SHORT).show();
+                            "已同步「" + workspaceName + "」：" + sourceCount + " 個日曆檢視、共 " + eventCount + " 筆近期行程！",
+                            Toast.LENGTH_LONG).show();
                 }
             }
 
@@ -282,6 +501,53 @@ public class MainActivity extends Activity {
                 Toast.makeText(MainActivity.this, errorMessage, Toast.LENGTH_LONG).show();
             }
         });
+    }
+
+    private void showAddNotionByUrlDialog() {
+        String rawToken = inputNotionToken.getText().toString().trim();
+        if (!rawToken.isEmpty()) {
+            NotionManager.saveToken(this, rawToken);
+        }
+        EditText input = new EditText(this);
+        input.setHint("貼上 Notion 資料庫網址 (https://www.notion.so/...) 或 32 碼 ID");
+        input.setMaxLines(3);
+        int pad = dp(20);
+        LinearLayout wrap = new LinearLayout(this);
+        wrap.setPadding(pad, dp(12), pad, 0);
+        wrap.addView(input, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        new AlertDialog.Builder(this)
+                .setTitle("手動貼上資料庫連結／ID")
+                .setMessage("若剛在 Notion 開啟權限但搜尋索引尚未更新，可在 Notion 資料庫點「Copy link」貼到下方直接加入：")
+                .setView(wrap)
+                .setPositiveButton("讀取並加入", (d, w) -> {
+                    String link = input.getText().toString().trim();
+                    if (link.isEmpty()) return;
+                    notionStatus.setText("⏳ 正在直接讀取指定的 Notion 資料庫與行程…");
+                    NotionManager.addDatabaseByUrlOrIdAsync(this, link, new NotionManager.SyncCallback() {
+                        @Override
+                        public void onSuccess(String workspaceName, int sourceCount, int eventCount) {
+                            refreshNotionUiState();
+                            showCalendars(hasCalPermission());
+                            Toast.makeText(MainActivity.this,
+                                    "成功加入資料庫！目前共快取 " + eventCount + " 筆行程",
+                                    Toast.LENGTH_LONG).show();
+                        }
+
+                        @Override
+                        public void onError(String errorMessage) {
+                            notionStatus.setText("❌ " + errorMessage);
+                            new AlertDialog.Builder(MainActivity.this)
+                                    .setTitle("無法讀取此 Notion 資料庫")
+                                    .setMessage(errorMessage)
+                                    .setPositiveButton("好", null)
+                                    .show();
+                        }
+                    });
+                })
+                .setNegativeButton("取消", null)
+                .show();
     }
 
     private void confirmClearNotion() {
@@ -310,10 +576,7 @@ public class MainActivity extends Activity {
         }
         new AlertDialog.Builder(this)
                 .setTitle("選擇 Notion 資料庫")
-                .setItems(dbNames, (d1, dbIdx) -> {
-                    NotionManager.NotionDatabaseMeta chosenDb = ws.databases.get(dbIdx);
-                    promptViewForCustomNotion(chosenDb);
-                })
+                .setItems(dbNames, (d1, dbIdx) -> promptViewForCustomNotion(ws.databases.get(dbIdx)))
                 .show();
     }
 
@@ -410,6 +673,7 @@ public class MainActivity extends Activity {
     private void refreshNotionUiState() {
         boolean connected = NotionManager.hasToken(this);
         btnNotionClear.setVisibility(connected ? View.VISIBLE : View.GONE);
+        btnNotionAddUrl.setVisibility(connected ? View.VISIBLE : View.GONE);
         NotionManager.CachedWorkspace ws = NotionManager.loadCache(this);
         if (!connected) {
             notionStatus.setText("尚未連接 Notion（貼上 Token 後即可自動抓取你的 Notion 日曆）");
@@ -420,12 +684,18 @@ public class MainActivity extends Activity {
                     ? Instant.ofEpochMilli(lastMs).atZone(ZoneId.systemDefault())
                     .format(DateTimeFormatter.ofPattern("HH:mm"))
                     : "--:--";
-            notionStatus.setText(String.format(Locale.TAIWAN,
-                    "✅ 已連結：%s（%d 個日曆檢視 · 快取 %d 筆近期行程 · 上次同步 %s）",
-                    ws.workspaceName, ws.sources.size(), ws.events.size(), timeStr));
+            String base = String.format(Locale.TAIWAN,
+                    "✅ 已連結：%s（%d 個日曆檢視 · 共抓到 %d 筆近期行程 · 同步於 %s）",
+                    ws.workspaceName, ws.sources.size(), ws.events.size(), timeStr);
+            if (ws.sources.isEmpty()) {
+                base += "\n⚠️ 尚未抓到授權的資料庫！請點上方「設定 Access 權限」到 Notion Integration 的 Access 分頁勾選資料庫，或點下方「貼上資料庫連結／ID 加入」。";
+            } else if (!TextUtils.isEmpty(ws.diagnosticNote)) {
+                base += "\n⚠️ " + ws.diagnosticNote;
+            }
+            notionStatus.setText(base);
             btnNotionAddCustom.setVisibility(ws.databases.isEmpty() ? View.GONE : View.VISIBLE);
         } else {
-            notionStatus.setText("已儲存 Token，請點「連接並同步 Notion」進行首次掃描");
+            notionStatus.setText("已儲存 Token，請點「連接並同步 Notion」進行掃描");
             btnNotionAddCustom.setVisibility(View.GONE);
         }
     }
@@ -440,6 +710,7 @@ public class MainActivity extends Activity {
             grant.setText(R.string.btn_grant);
         }
 
+        refreshWidgetSelectorTabs();
         refreshNotionUiState();
         showCalendars(granted);
         CalendarWidgetProvider.requestSync(this, CalendarWidgetProvider.SYNC_ON_TOUCH_MS);
@@ -457,7 +728,8 @@ public class MainActivity extends Activity {
             return;
         }
 
-        Set<String> hidden = CalendarWidgetProvider.hiddenCalendars(this);
+        final int targetProfileId = editingProfileId;
+        Set<String> hidden = CalendarWidgetProvider.hiddenCalendars(this, targetProfileId);
         TextView summaryView = note("");
         calendars.addView(summaryView);
 
@@ -520,8 +792,8 @@ public class MainActivity extends Activity {
                                         getString(ok ? R.string.sync_requested : R.string.sync_failed, displayName),
                                         Toast.LENGTH_LONG).show();
                             }
-                            CalendarWidgetProvider.setCalendarHidden(this, calId, !checked);
-                            CalendarWidgetProvider.updateAll(this);
+                            CalendarWidgetProvider.setCalendarHidden(this, targetProfileId, calId, !checked);
+                            CalendarWidgetProvider.updateWidget(this, targetProfileId);
                             calendars.post(() -> showCalendars(hasCalPermission()));
                         });
                         calendars.addView(cb);
@@ -543,13 +815,13 @@ public class MainActivity extends Activity {
             for (NotionManager.NotionSource src : sources) {
                 int srcColor = NotionManager.getSourceColor(this, src);
                 boolean isChecked = !hidden.contains(src.sourceKey);
+                int evCount = notionWs.countEventsForSource(src.sourceKey);
 
                 LinearLayout row = new LinearLayout(this);
                 row.setOrientation(LinearLayout.HORIZONTAL);
                 row.setGravity(Gravity.CENTER_VERTICAL);
                 row.setMinimumHeight(dp(44));
 
-                // Tappable Notion color square (matching Notion Calendar's sidebar color icon)
                 View colorChip = new View(this);
                 LinearLayout.LayoutParams chipLp = new LinearLayout.LayoutParams(dp(22), dp(22));
                 chipLp.setMarginEnd(dp(8));
@@ -567,26 +839,28 @@ public class MainActivity extends Activity {
                 LinearLayout.LayoutParams cbLp = new LinearLayout.LayoutParams(
                         0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
                 cb.setLayoutParams(cbLp);
-                cb.setText(src.fullTitleWithIcon());
+                cb.setText(src.fullTitleWithIcon() + "（" + evCount + " 筆）");
                 cb.setTextSize(15f);
                 cb.setMinHeight(dp(44));
                 cb.setChecked(isChecked);
                 cb.setOnCheckedChangeListener((btn, checked) -> {
-                    CalendarWidgetProvider.setCalendarKeyHidden(this, src.sourceKey, !checked);
-                    CalendarWidgetProvider.updateAll(this);
-                    if (checked) {
+                    CalendarWidgetProvider.setCalendarKeyHidden(this, targetProfileId, src.sourceKey, !checked);
+                    CalendarWidgetProvider.updateWidget(this, targetProfileId);
+                    if (checked && evCount == 0) {
                         NotionManager.refreshEventsOnlyAsync(this, 0L, new NotionManager.SyncCallback() {
                             @Override
                             public void onSuccess(String workspaceName, int sourceCount, int eventCount) {
                                 refreshNotionUiState();
+                                showCalendars(hasCalPermission());
                             }
 
                             @Override
                             public void onError(String errorMessage) {
                             }
                         });
+                    } else {
+                        calendars.post(() -> showCalendars(hasCalPermission()));
                     }
-                    calendars.post(() -> showCalendars(hasCalPermission()));
                 });
                 row.addView(cb);
 

@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/main_scroll"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:fitsSystemWindows="true">
@@ -26,6 +27,34 @@
             android:textColor="@color/text_muted"
             android:textSize="13sp"
             android:textStyle="bold" />
+
+        <!-- Shown when launched from Launcher's widget configure / reconfigure action -->
+        <LinearLayout
+            android:id="@+id/config_banner_card"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:background="@drawable/card_bg"
+            android:orientation="vertical"
+            android:padding="14dp"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/config_banner_text"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:lineSpacingExtra="3dp"
+                android:textColor="@color/accent"
+                android:textSize="14sp"
+                android:textStyle="bold" />
+
+            <Button
+                android:id="@+id/btn_finish_configure"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/btn_finish_configure" />
+        </LinearLayout>
 
         <TextView
             android:layout_width="match_parent"
@@ -198,19 +227,101 @@
                 android:textStyle="bold" />
 
             <Button
-                android:id="@+id/btn_notion_add_custom"
+                android:id="@+id/btn_notion_add_url"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
+                android:text="@string/btn_notion_add_url"
+                android:visibility="gone" />
+
+            <Button
+                android:id="@+id/btn_notion_add_custom"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
                 android:text="@string/btn_notion_add_custom"
                 android:visibility="gone" />
         </LinearLayout>
 
-        <!-- Display Settings -->
-        <TextView
+        <!-- Per-Widget Instance Selector Card -->
+        <LinearLayout
+            android:id="@+id/widget_selector_card"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="28dp"
+            android:background="@drawable/card_bg"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/section_widget_target"
+                android:textColor="@color/accent"
+                android:textSize="17sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:lineSpacingExtra="3dp"
+                android:text="@string/widget_target_hint"
+                android:textSize="13sp" />
+
+            <HorizontalScrollView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:scrollbars="none">
+
+                <LinearLayout
+                    android:id="@+id/widget_tabs"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal" />
+            </HorizontalScrollView>
+
+            <TextView
+                android:id="@+id/editing_target_label"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:textSize="14sp"
+                android:textStyle="bold" />
+
+            <LinearLayout
+                android:id="@+id/widget_actions_row"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/btn_rename_widget"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/btn_rename_widget"
+                    android:textSize="13sp" />
+
+                <Button
+                    android:id="@+id/btn_copy_to_all"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:text="@string/btn_copy_to_all"
+                    android:textSize="13sp" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- Display Settings (Scoped to Selected Widget) -->
+        <TextView
+            android:id="@+id/section_display_title"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
             android:text="@string/section_display"
             android:textColor="@color/accent"
             android:textSize="17sp"
@@ -269,8 +380,9 @@
             android:text="@string/days_hint"
             android:textSize="13sp" />
 
-        <!-- Calendars Checklist (System + Notion) -->
+        <!-- Calendars Checklist (Scoped to Selected Widget) -->
         <TextView
+            android:id="@+id/section_calendars_title"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="28dp"

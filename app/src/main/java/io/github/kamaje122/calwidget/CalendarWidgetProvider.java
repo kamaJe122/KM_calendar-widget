@@ -43,6 +43,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public class CalendarWidgetProvider extends AppWidgetProvider {
 
+    public static final int PROFILE_DEFAULT = 0;
+
     static final String ACTION_SELECT = "io.github.kamaje122.calwidget.SELECT";
     static final String ACTION_TODAY = "io.github.kamaje122.calwidget.TODAY";
     static final String ACTION_TICK = "io.github.kamaje122.calwidget.TICK";
@@ -54,6 +56,8 @@ public class CalendarWidgetProvider extends AppWidgetProvider {
     private static final String KEY_LAST_SYNC = "lastSyncRequest";
     private static final String KEY_SELECTED = "selectedEpochDay";
     private static final String KEY_SELECTED_ON = "selectedOnEpochDay";
+    private static final String KEY_INIT_PREFIX = "init_";
+    private static final String KEY_NAME_PREFIX = "name_";
 
     static final int MAX_DAYS = 14;
     static final long SYNC_ON_TOUCH_MS = 20_000L;
@@ -91,25 +95,51 @@ public class CalendarWidgetProvider extends AppWidgetProvider {
     public void onReceive(Context context, Intent intent) {
         String action = intent.getAction();
         if (ACTION_SELECT.equals(action) && intent.getData() != null) {
+            List<String> segs = intent.getData().getPathSegments();
             try {
-                long epochDay = Long.parseLong(intent.getData().getLastPathSegment());
-                prefs(context).edit()
-                        .putLong(KEY_SELECTED, epochDay)
-                        .putLong(KEY_SELECTED_ON, LocalDate.now().toEpochDay())
-                        .apply();
+                if (segs.size() >= 2) {
+                    int widgetId = Integer.parseInt(segs.get(0));
+                    long epochDay = Long.parseLong(segs.get(1));
+                    prefs(context).edit()
+                            .putLong(scopedKey(KEY_SELECTED, widgetId), epochDay)
+                            .putLong(scopedKey(KEY_SELECTED_ON, widgetId), LocalDate.now().toEpochDay())
+                            .apply();
+                    updateWidget(context, widgetId);
+                } else if (segs.size() == 1) {
+                    long epochDay = Long.parseLong(segs.get(0));
+                    prefs(context).edit()
+                            .putLong(KEY_SELECTED, epochDay)
+                            .putLong(KEY_SELECTED_ON, LocalDate.now().toEpochDay())
+                            .apply();
+                    updateAll(context);
+                }
             } catch (NumberFormatException ignored) {
             }
-            updateAll(context);
             syncWithAsyncGuard(this, context, SYNC_ON_TOUCH_MS);
             return;
         }
 
         if (ACTION_TODAY.equals(action)) {
-            prefs(context).edit()
-                    .remove(KEY_SELECTED)
-                    .remove(KEY_SELECTED_ON)
-                    .apply();
-            updateAll(context);
+            int widgetId = PROFILE_DEFAULT;
+            if (intent.getData() != null && intent.getData().getLastPathSegment() != null) {
+                try {
+                    widgetId = Integer.parseInt(intent.getData().getLastPathSegment());
+                } catch (NumberFormatException ignored) {
+                }
+            }
+            if (widgetId > 0) {
+                prefs(context).edit()
+                        .remove(scopedKey(KEY_SELECTED, widgetId))
+                        .remove(scopedKey(KEY_SELECTED_ON, widgetId))
+                        .apply();
+                updateWidget(context, widgetId);
+            } else {
+                prefs(context).edit()
+                        .remove(KEY_SELECTED)
+                        .remove(KEY_SELECTED_ON)
+                        .apply();
+                updateAll(context);
+            }
             syncWithAsyncGuard(this, context, SYNC_ON_TOUCH_MS);
             return;
         }
@@ -171,7 +201,34 @@ public class CalendarWidgetProvider extends AppWidgetProvider {
     @Override
     public void onUpdate(Context context, AppWidgetManager appWidgetManager, int[] appWidgetIds) {
         requestSync(context, SYNC_BACKGROUND_MS);
-        updateAll(context);
+        for (int id : appWidgetIds) {
+            ensureWidgetInitialized(context, id);
+            appWidgetManager.updateAppWidget(id, buildViews(context, id));
+        }
+        scheduleNextTick(context);
+    }
+
+    @Override
+    public void onAppWidgetOptionsChanged(Context context, AppWidgetManager appWidgetManager,
+                                          int appWidgetId, Bundle newOptions) {
+        ensureWidgetInitialized(context, appWidgetId);
+        appWidgetManager.updateAppWidget(appWidgetId, buildViews(context, appWidgetId));
+    }
+
+    @Override
+    public void onDeleted(Context context, int[] appWidgetIds) {
+        SharedPreferences.Editor ed = prefs(context).edit();
+        for (int id : appWidgetIds) {
+            if (id <= 0) continue;
+            ed.remove(KEY_INIT_PREFIX + id)
+                    .remove(KEY_NAME_PREFIX + id)
+                    .remove(scopedKey(KEY_DAYS, id))
+                    .remove(scopedKey(KEY_SHOW_ALL_DAY, id))
+                    .remove(scopedKey(KEY_HIDDEN_CALENDARS, id))
+                    .remove(scopedKey(KEY_SELECTED, id))
+                    .remove(scopedKey(KEY_SELECTED_ON, id));
+        }
+        ed.apply();
     }
 
     @Override
@@ -182,13 +239,109 @@ public class CalendarWidgetProvider extends AppWidgetProvider {
         }
     }
 
-    static void updateAll(Context context) {
+    public static int[] getActiveWidgetIds(Context context) {
         AppWidgetManager mgr = AppWidgetManager.getInstance(context);
         ComponentName cn = new ComponentName(context, CalendarWidgetProvider.class);
-        if (mgr.getAppWidgetIds(cn).length == 0) {
+        int[] ids = mgr.getAppWidgetIds(cn);
+        return ids != null ? ids : new int[0];
+    }
+
+    public static void ensureWidgetInitialized(Context context, int appWidgetId) {
+        if (appWidgetId <= 0) return;
+        SharedPreferences sp = prefs(context);
+        if (sp.contains(KEY_INIT_PREFIX + appWidgetId)) return;
+
+        int defDays = daysToShow(context, PROFILE_DEFAULT);
+        boolean defAllDay = showAllDay(context, PROFILE_DEFAULT);
+        Set<String> defHidden = hiddenCalendars(context, PROFILE_DEFAULT);
+
+        sp.edit()
+                .putBoolean(KEY_INIT_PREFIX + appWidgetId, true)
+                .putInt(scopedKey(KEY_DAYS, appWidgetId), defDays)
+                .putBoolean(scopedKey(KEY_SHOW_ALL_DAY, appWidgetId), defAllDay)
+                .putStringSet(scopedKey(KEY_HIDDEN_CALENDARS, appWidgetId), defHidden)
+                .apply();
+    }
+
+    public static String getWidgetName(Context context, int profileId) {
+        if (profileId <= 0) {
+            return "預設模板（新小工具）";
+        }
+        String custom = prefs(context).getString(KEY_NAME_PREFIX + profileId, "").trim();
+        if (!custom.isEmpty()) {
+            return custom + " (#" + profileId + ")";
+        }
+        return "小工具 #" + profileId;
+    }
+
+    public static String getRawWidgetNickname(Context context, int profileId) {
+        if (profileId <= 0) return "";
+        return prefs(context).getString(KEY_NAME_PREFIX + profileId, "").trim();
+    }
+
+    public static void setWidgetNickname(Context context, int profileId, String nickname) {
+        if (profileId <= 0) return;
+        prefs(context).edit().putString(KEY_NAME_PREFIX + profileId, nickname == null ? "" : nickname.trim()).apply();
+    }
+
+    public static void copyProfileToAllWidgets(Context context, int sourceProfileId) {
+        int days = daysToShow(context, sourceProfileId);
+        boolean allDay = showAllDay(context, sourceProfileId);
+        Set<String> hidden = hiddenCalendars(context, sourceProfileId);
+
+        SharedPreferences.Editor ed = prefs(context).edit();
+        ed.putInt(KEY_DAYS, days)
+                .putBoolean(KEY_SHOW_ALL_DAY, allDay)
+                .putStringSet(KEY_HIDDEN_CALENDARS, new HashSet<>(hidden));
+
+        for (int id : getActiveWidgetIds(context)) {
+            ed.putBoolean(KEY_INIT_PREFIX + id, true)
+                    .putInt(scopedKey(KEY_DAYS, id), days)
+                    .putBoolean(scopedKey(KEY_SHOW_ALL_DAY, id), allDay)
+                    .putStringSet(scopedKey(KEY_HIDDEN_CALENDARS, id), new HashSet<>(hidden));
+        }
+        ed.apply();
+        updateAll(context);
+    }
+
+    /**
+     * Returns true ONLY if every active widget AND the default profile hide this calendar key.
+     * Ensures NotionManager syncs any Notion source visible on at least one widget.
+     */
+    public static boolean isHiddenInAllProfiles(Context context, String calendarKey) {
+        if (!hiddenCalendars(context, PROFILE_DEFAULT).contains(calendarKey)) {
+            return false;
+        }
+        for (int id : getActiveWidgetIds(context)) {
+            ensureWidgetInitialized(context, id);
+            if (!hiddenCalendars(context, id).contains(calendarKey)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static void updateWidget(Context context, int appWidgetId) {
+        if (appWidgetId <= 0) {
+            updateAll(context);
             return;
         }
-        mgr.updateAppWidget(cn, buildViews(context));
+        ensureWidgetInitialized(context, appWidgetId);
+        AppWidgetManager mgr = AppWidgetManager.getInstance(context);
+        mgr.updateAppWidget(appWidgetId, buildViews(context, appWidgetId));
+        scheduleNextTick(context);
+    }
+
+    static void updateAll(Context context) {
+        AppWidgetManager mgr = AppWidgetManager.getInstance(context);
+        int[] ids = getActiveWidgetIds(context);
+        if (ids.length == 0) {
+            return;
+        }
+        for (int id : ids) {
+            ensureWidgetInitialized(context, id);
+            mgr.updateAppWidget(id, buildViews(context, id));
+        }
         scheduleNextTick(context);
     }
 
@@ -238,53 +391,66 @@ public class CalendarWidgetProvider extends AppWidgetProvider {
         }
     }
 
-    static int daysToShow(Context context) {
-        int val = prefs(context).getInt(KEY_DAYS, 1);
+    static int daysToShow(Context context, int profileId) {
+        ensureWidgetInitialized(context, profileId);
+        int val = prefs(context).getInt(scopedKey(KEY_DAYS, profileId), 1);
         return Math.max(1, Math.min(MAX_DAYS, val));
     }
 
-    static void setDaysToShow(Context context, int days) {
+    static void setDaysToShow(Context context, int profileId, int days) {
+        ensureWidgetInitialized(context, profileId);
         prefs(context).edit()
-                .putInt(KEY_DAYS, Math.max(1, Math.min(MAX_DAYS, days)))
+                .putInt(scopedKey(KEY_DAYS, profileId), Math.max(1, Math.min(MAX_DAYS, days)))
                 .apply();
     }
 
-    static boolean showAllDay(Context context) {
-        return prefs(context).getBoolean(KEY_SHOW_ALL_DAY, true);
+    static boolean showAllDay(Context context, int profileId) {
+        ensureWidgetInitialized(context, profileId);
+        return prefs(context).getBoolean(scopedKey(KEY_SHOW_ALL_DAY, profileId), true);
     }
 
-    static void setShowAllDay(Context context, boolean show) {
-        prefs(context).edit().putBoolean(KEY_SHOW_ALL_DAY, show).apply();
+    static void setShowAllDay(Context context, int profileId, boolean show) {
+        ensureWidgetInitialized(context, profileId);
+        prefs(context).edit().putBoolean(scopedKey(KEY_SHOW_ALL_DAY, profileId), show).apply();
     }
 
-    static Set<String> hiddenCalendars(Context context) {
-        return new HashSet<>(prefs(context).getStringSet(KEY_HIDDEN_CALENDARS, Collections.emptySet()));
+    static Set<String> hiddenCalendars(Context context, int profileId) {
+        ensureWidgetInitialized(context, profileId);
+        return new HashSet<>(prefs(context).getStringSet(
+                scopedKey(KEY_HIDDEN_CALENDARS, profileId), Collections.emptySet()));
     }
 
-    static void setCalendarHidden(Context context, long calendarId, boolean hidden) {
-        setCalendarKeyHidden(context, String.valueOf(calendarId), hidden);
+    static void setCalendarHidden(Context context, int profileId, long calendarId, boolean hidden) {
+        setCalendarKeyHidden(context, profileId, String.valueOf(calendarId), hidden);
     }
 
-    static void setCalendarKeyHidden(Context context, String key, boolean hidden) {
-        Set<String> set = hiddenCalendars(context);
+    static void setCalendarKeyHidden(Context context, int profileId, String key, boolean hidden) {
+        ensureWidgetInitialized(context, profileId);
+        Set<String> set = hiddenCalendars(context, profileId);
         if (hidden) {
             set.add(key);
         } else {
             set.remove(key);
         }
-        prefs(context).edit().putStringSet(KEY_HIDDEN_CALENDARS, set).apply();
+        prefs(context).edit().putStringSet(scopedKey(KEY_HIDDEN_CALENDARS, profileId), set).apply();
     }
 
-    private static RemoteViews buildViews(Context context) {
+    private static String scopedKey(String base, int profileId) {
+        return profileId > 0 ? (base + "_" + profileId) : base;
+    }
+
+    private static RemoteViews buildViews(Context context, int appWidgetId) {
         ZoneId zone = ZoneId.systemDefault();
         LocalDate today = LocalDate.now(zone);
-        LocalDate selected = selectedDay(context, today);
+        LocalDate selected = selectedDay(context, appWidgetId, today);
 
         RemoteViews views = new RemoteViews(context.getPackageName(), R.layout.widget_calendar);
         views.setTextViewText(R.id.month_title, context.getString(R.string.month_title, selected.getMonthValue()));
         views.setTextViewText(R.id.week_title, context.getString(R.string.week_title, weekNumber(selected)));
 
-        Intent todayIntent = new Intent(context, CalendarWidgetProvider.class).setAction(ACTION_TODAY);
+        Intent todayIntent = new Intent(context, CalendarWidgetProvider.class)
+                .setAction(ACTION_TODAY)
+                .setData(Uri.parse("calwidget://today/" + appWidgetId));
         views.setOnClickPendingIntent(R.id.month_header, broadcast(context, todayIntent));
 
         LocalDate gridStart = selected.withDayOfMonth(1)
@@ -317,18 +483,19 @@ public class CalendarWidgetProvider extends AppWidgetProvider {
 
             Intent selIntent = new Intent(context, CalendarWidgetProvider.class)
                     .setAction(ACTION_SELECT)
-                    .setData(Uri.parse("calwidget://select/" + d.toEpochDay()));
+                    .setData(Uri.parse("calwidget://select/" + appWidgetId + "/" + d.toEpochDay()));
             views.setOnClickPendingIntent(cellId, broadcast(context, selIntent));
         }
 
         views.setTextViewText(R.id.weekday_title, WEEKDAYS[selected.getDayOfWeek().getValue() - 1]);
         views.setTextViewText(R.id.day_title, context.getString(R.string.day_title, selected.getDayOfMonth()));
 
+        int reqBase = appWidgetId * 16;
         long selectedStartMillis = selected.atStartOfDay(zone).toInstant().toEpochMilli();
         Uri dayUri = ContentUris.withAppendedId(
                 CalendarContract.CONTENT_URI.buildUpon().appendPath("time").build(),
                 selectedStartMillis);
-        PendingIntent openDayIntent = activity(context, 1, new Intent(Intent.ACTION_VIEW, dayUri));
+        PendingIntent openDayIntent = activity(context, reqBase + 1, new Intent(Intent.ACTION_VIEW, dayUri));
 
         boolean hasCalPerm = context.checkSelfPermission(Manifest.permission.READ_CALENDAR)
                 == PackageManager.PERMISSION_GRANTED;
@@ -338,17 +505,20 @@ public class CalendarWidgetProvider extends AppWidgetProvider {
             views.setViewVisibility(R.id.empty, View.GONE);
             views.setViewVisibility(R.id.agenda_list, View.VISIBLE);
             views.setOnClickPendingIntent(R.id.day_header, openDayIntent);
-            views.setRemoteAdapter(R.id.agenda_list, buildAgenda(context, selected, today, zone));
+            views.setRemoteAdapter(R.id.agenda_list, buildAgenda(context, appWidgetId, selected, today, zone));
 
-            Intent tpl = new Intent(context, OpenActivity.class);
+            Intent tpl = new Intent(context, OpenActivity.class)
+                    .setData(Uri.parse("calwidget://open/" + appWidgetId));
             PendingIntent piTpl = PendingIntent.getActivity(
-                    context, 20, tpl, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_MUTABLE);
+                    context, reqBase + 4, tpl, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_MUTABLE);
             views.setPendingIntentTemplate(R.id.agenda_list, piTpl);
         } else {
             views.setViewVisibility(R.id.agenda_list, View.GONE);
             views.setViewVisibility(R.id.empty, View.VISIBLE);
             views.setTextViewText(R.id.empty, context.getString(R.string.need_permission));
-            PendingIntent openMain = activity(context, 2, new Intent(context, MainActivity.class));
+            Intent cfgIntent = new Intent(context, MainActivity.class)
+                    .putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, appWidgetId);
+            PendingIntent openMain = activity(context, reqBase + 2, cfgIntent);
             views.setOnClickPendingIntent(R.id.agenda, openMain);
             views.setOnClickPendingIntent(R.id.day_header, openMain);
             views.setOnClickPendingIntent(R.id.empty, openMain);
@@ -361,19 +531,19 @@ public class CalendarWidgetProvider extends AppWidgetProvider {
         Intent insertIntent = new Intent(Intent.ACTION_INSERT, CalendarContract.Events.CONTENT_URI)
                 .putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, insertBeginMillis)
                 .putExtra(CalendarContract.EXTRA_EVENT_END_TIME, insertBeginMillis + 3_600_000L);
-        views.setOnClickPendingIntent(R.id.add, activity(context, 3, insertIntent));
+        views.setOnClickPendingIntent(R.id.add, activity(context, reqBase + 3, insertIntent));
 
         return views;
     }
 
     private static RemoteViews.RemoteCollectionItems buildAgenda(
-            Context context, LocalDate startDay, LocalDate today, ZoneId zone) {
+            Context context, int appWidgetId, LocalDate startDay, LocalDate today, ZoneId zone) {
         String pkg = context.getPackageName();
         RemoteViews.RemoteCollectionItems.Builder builder = new RemoteViews.RemoteCollectionItems.Builder()
                 .setHasStableIds(false)
                 .setViewTypeCount(3);
 
-        int days = daysToShow(context);
+        int days = daysToShow(context, appWidgetId);
         long itemId = 0L;
 
         for (int offset = 0; offset < days; offset++) {
@@ -390,7 +560,7 @@ public class CalendarWidgetProvider extends AppWidgetProvider {
             }
 
             boolean isToday = day.equals(today);
-            List<Event> events = loadEvents(context, day, zone, isToday);
+            List<Event> events = loadEvents(context, appWidgetId, day, zone, isToday);
             if (events.isEmpty()) {
                 RemoteViews emptyItem = new RemoteViews(pkg, R.layout.widget_empty_item);
                 emptyItem.setTextViewText(R.id.item_root,
@@ -426,22 +596,25 @@ public class CalendarWidgetProvider extends AppWidgetProvider {
                 .get(IsoFields.WEEK_OF_WEEK_BASED_YEAR);
     }
 
-    private static LocalDate selectedDay(Context context, LocalDate today) {
+    private static LocalDate selectedDay(Context context, int appWidgetId, LocalDate today) {
         SharedPreferences sp = prefs(context);
-        if (sp.contains(KEY_SELECTED) && sp.getLong(KEY_SELECTED_ON, -1L) == today.toEpochDay()) {
-            return LocalDate.ofEpochDay(sp.getLong(KEY_SELECTED, today.toEpochDay()));
+        String kSel = scopedKey(KEY_SELECTED, appWidgetId);
+        String kOn = scopedKey(KEY_SELECTED_ON, appWidgetId);
+        if (sp.contains(kSel) && sp.getLong(kOn, -1L) == today.toEpochDay()) {
+            return LocalDate.ofEpochDay(sp.getLong(kSel, today.toEpochDay()));
         }
         return today;
     }
 
-    private static List<Event> loadEvents(Context context, LocalDate day, ZoneId zone, boolean filterEndedToday) {
+    private static List<Event> loadEvents(
+            Context context, int appWidgetId, LocalDate day, ZoneId zone, boolean filterEndedToday) {
         List<Event> list = new ArrayList<>();
         long dayStart = day.atStartOfDay(zone).toInstant().toEpochMilli();
         long dayEnd = day.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli();
         long julianDay = day.getLong(JulianFields.JULIAN_DAY);
         long nowMillis = System.currentTimeMillis();
-        boolean includeAllDay = showAllDay(context);
-        Set<String> hidden = hiddenCalendars(context);
+        boolean includeAllDay = showAllDay(context, appWidgetId);
+        Set<String> hidden = hiddenCalendars(context, appWidgetId);
 
         if (context.checkSelfPermission(Manifest.permission.READ_CALENDAR)
                 == PackageManager.PERMISSION_GRANTED) {
@@ -515,7 +688,7 @@ public class CalendarWidgetProvider extends AppWidgetProvider {
             }
         }
 
-        // Merge cached Notion Calendar events
+        // Merge cached Notion Calendar events scoped to this specific widget's checklist & all-day setting
         list.addAll(NotionManager.loadEventsForDay(
                 context, day, zone, filterEndedToday, includeAllDay, hidden));
 

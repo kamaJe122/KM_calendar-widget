@@ -2,7 +2,7 @@
 <resources>
     <string name="app_name">KM 桌面行事曆小工具</string>
     <string name="main_title">KM 桌面行事曆小工具</string>
-    <string name="main_intro">在桌面放一個 5×2 的月曆＋行程小工具。\n同時支援手機「系統行事曆（Google 日曆）」與「Notion 日曆資料庫／多檢視表」，並可直接在 App 內透過 GitHub 更新安裝。</string>
+    <string name="main_intro">在桌面放一個或多個 5×2 的月曆＋行程小工具。\n支援「不同位置的小工具各自獨立設定（全天開關／天數／日曆清單）」，同時整合 Google 行事曆與 Notion 日曆資料庫。</string>
 
     <string name="status_granted">✅ 已授權讀取系統行事曆</string>
     <string name="status_denied">⚠️ 尚未授權讀取系統行事曆（仍可單獨使用 Notion 日曆）</string>
@@ -17,13 +17,21 @@
     <string name="btn_download_update">下載並安裝新版</string>
     <string name="btn_open_github">開啟 GitHub</string>
 
+    <!-- Per-Widget Selector -->
+    <string name="section_widget_target">個別小工具獨立設定</string>
+    <string name="widget_target_hint">點選下方要調整的小工具，底下的「顯示全天」、「顯示天數」與「勾選的日曆列表」就會只套用到該小工具！\n（提示：你也可以在桌面長按任一小工具 → 點「設定／鉛筆圖示」直接跳進來調整它。）</string>
+    <string name="btn_rename_widget">✏️ 修改小工具名稱</string>
+    <string name="btn_copy_to_all">📋 套用到所有小工具</string>
+    <string name="btn_finish_configure">✅ 完成此小工具設定並返回桌面</string>
+
     <!-- Notion Integration -->
     <string name="section_notion">Notion 日曆串接</string>
-    <string name="notion_guide">1. 點下方「取得 Notion Token」建立 Internal Integration，複製 Secret（ntn_… 或 secret_…）。\n2. 在 Notion 打開要顯示的日曆資料庫（或上層母頁面），點右上角「•••」→「Connections（連結）」加入該 Integration。\n3. 貼上 Token 並點「連接並同步 Notion」，即可自動抓出所有資料庫與日曆／時間軸檢視！</string>
+    <string name="notion_guide">1. 點「取得 Notion Token / 設定權限」建立 Internal Integration，在「Configuration」複製 Secret（ntn_…）。\n2. 重要！請在同頁上方切換到「Access（存取權限）」分頁勾選要讀取的資料庫／頁面並按 Save（或在 Notion 打開原始資料庫本體 → 右上角「•••」→「Connections」加入此 Integration）。\n3. 貼上 Token 並點「連接並同步 Notion」即可抓出所有資料庫與行程！</string>
     <string name="notion_token_hint">貼上 Notion Integration Secret (ntn_... / secret_...)</string>
-    <string name="btn_notion_portal">取得 Notion Token</string>
+    <string name="btn_notion_portal">取得 Notion Token ／ 設定 Access 權限</string>
     <string name="btn_notion_sync">連接並同步 Notion</string>
     <string name="btn_notion_clear">中斷連結</string>
+    <string name="btn_notion_add_url">🔗 貼上資料庫連結／ID 加入</string>
     <string name="btn_notion_add_custom">＋ 新增資料庫其他檢視／日期欄位</string>
 
     <!-- Display Settings -->
@@ -35,17 +43,17 @@
 
     <!-- Calendars List -->
     <string name="section_calendars">要顯示的日曆（系統 ＋ Notion）</string>
-    <string name="calendars_hint">勾選的日曆才會出現在小工具上。Notion 日曆可點左側「色塊按鈕」自訂代表顏色；系統標示「尚未同步到手機」的日曆勾選後會請 Google 同步。</string>
+    <string name="calendars_hint">勾選的日曆才會出現在「目前選取的小工具」上。Notion 日曆可點左側「色塊按鈕」自訂顏色，括號內會顯示抓到的近期行程筆數。</string>
     <string name="calendars_need_permission">尚未授權系統行事曆，也尚未連接 Notion 日曆。</string>
     <string name="calendars_none">目前沒有找到任何日曆。請確認 Google 日曆已登入同步，或在上方連接 Notion 日曆。</string>
     <string name="calendar_not_synced">%s（尚未同步到手機）</string>
-    <string name="calendar_summary">共 %1$d 個來源帳號、%2$d 個日曆／檢視，小工具顯示其中 %3$d 個</string>
+    <string name="calendar_summary">共 %1$d 個來源帳號、%2$d 個日曆／檢視，此小工具顯示其中 %3$d 個</string>
     <string name="sync_requested">已請 Google 同步「%s」，行程可能要等幾分鐘才會出現</string>
     <string name="sync_failed">無法開啟「%s」的同步，請確認已授權行事曆權限</string>
 
     <!-- Widget Strings -->
     <string name="widget_label">月曆＋今日行程 5×2</string>
-    <string name="widget_description">左邊月曆（含週數）、右邊當日行程，同時整合手機 Google 行事曆與 Notion 日曆資料庫。</string>
+    <string name="widget_description">左邊月曆（含週數）、右邊當日行程，支援多個小工具各自設定不同日曆與全天開關。</string>
     <string name="month_title">%d月</string>
     <string name="week_title">第 %d 週</string>
     <string name="day_title">%d日</string>
@@ -56,5 +64,5 @@
     <string name="need_permission">點這裡設定\n行事曆或 Notion</string>
     <string name="add_event">新增行程</string>
 
-    <string name="main_tips">小工具操作：\n• 點任一日期 → 右邊顯示那一天的行程\n• 點灰色日期 → 跳到上／下個月\n• 點左上角月份 → 回到今天\n• 點日期或月份時，會順便背景同步 Google 與 Notion 日曆\n• 右邊行程可以上下滑動\n• 點系統行程 → 在行事曆 App 打開\n• 點 Notion 行程 → 直接在 Notion 打開該頁面\n• 點 ＋ → 新增行程</string>
+    <string name="main_tips">小工具操作：\n• 桌面可放多個小工具，各自設定不同的全天開關與日曆清單\n• 長按桌面小工具 → 點「設定（鉛筆）」可直接調整該小工具\n• 點任一日期 → 右邊顯示那一天的行程（各小工具獨立記憶）\n• 點灰色日期 → 跳到上／下個月；點左上角月份 → 回到今天\n• 點系統行程 → 開啟行事曆 App；點 Notion 行程 → 直接開啟 Notion 頁面\n• 點 ＋ → 新增行程</string>
 </resources>

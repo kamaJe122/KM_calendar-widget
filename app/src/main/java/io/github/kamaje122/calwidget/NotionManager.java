@@ -24,8 +24,6 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
-import java.time.ZonedDateTime;
-import java.time.temporal.JulianFields;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -39,17 +37,23 @@ import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * Handles Notion Official API (2026-03-11 / 2025-09-03 Data Sources & Views API)
- * workspace discovery, multi-view calendar filtering, custom per-source colors,
- * local offline caching, and background widget synchronization.
+ * Bulletproof Notion Calendar / Database & Views sync manager:
+ * - Multi-pronged discovery (2026-03-11 data_source search + page parent/child_database crawl + 2022-06-28 fallback)
+ * - Manual database URL / ID addition
+ * - 4-tier query fallback (without Wiki-only result_type bug; supports status group filters, "me" person resolution,
+ *   date, formula date, rollup date, created_time, last_edited_time)
+ * - Per-widget visibility & color customization
  */
 public final class NotionManager {
 
     private static final String PREFS_NOTION = "notion_prefs";
     private static final String KEY_TOKEN = "notion_token";
     private static final String KEY_WORKSPACE_NAME = "workspace_name";
+    private static final String KEY_OWNER_USER_ID = "owner_user_id";
     private static final String KEY_LAST_SYNC_MS = "last_sync_ms";
     private static final String KEY_COLOR_PREFIX = "color_";
 
@@ -57,6 +61,11 @@ public final class NotionManager {
     private static final String API_BASE = "https://api.notion.com/v1";
     private static final String NOTION_VERSION_PRIMARY = "2026-03-11";
     private static final String NOTION_VERSION_FALLBACK = "2025-09-03";
+    private static final String NOTION_VERSION_LEGACY = "2022-06-28";
+    private static final String BETA_STATUS_GROUP = "status-group-filters-2026-10-06";
+
+    private static final Pattern HEX32_PATTERN = Pattern.compile(
+            "([0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12})");
 
     public static final int[] NOTION_PALETTE = new int[]{
             0xFF2E90FA, // 藍 Blue
@@ -86,7 +95,7 @@ public final class NotionManager {
     public static final class DatePropOption {
         public final String id;
         public final String name;
-        public final String type; // "date", "created_time", "last_edited_time"
+        public final String type; // "date", "formula", "rollup", "created_time", "last_edited_time"
 
         DatePropOption(String id, String name, String type) {
             this.id = id;
@@ -98,7 +107,7 @@ public final class NotionManager {
     public static final class ViewOption {
         public final String id;
         public final String name;
-        public final String type; // "calendar", "timeline", "table", "board", "list", etc.
+        public final String type;
         public final String datePropId;
         public final String endDatePropId;
         public final String filterJson;
@@ -186,10 +195,10 @@ public final class NotionManager {
         public final String statusLabel;
         public final String notionUrl;
         public final boolean allDay;
-        public final long startEpochDay; // inclusive
-        public final long endEpochDay;   // inclusive (for allDay)
-        public final long beginMillis;   // for timed events
-        public final long endMillis;     // for timed events
+        public final long startEpochDay;
+        public final long endEpochDay;
+        public final long beginMillis;
+        public final long endMillis;
         public final boolean hasExplicitEnd;
 
         NotionCachedEvent(String sourceKey, String pageId, String title, String statusLabel,
@@ -214,13 +223,24 @@ public final class NotionManager {
         public final List<NotionSource> sources;
         public final List<NotionDatabaseMeta> databases;
         public final List<NotionCachedEvent> events;
+        public final String diagnosticNote;
 
         CachedWorkspace(String workspaceName, List<NotionSource> sources,
-                        List<NotionDatabaseMeta> databases, List<NotionCachedEvent> events) {
+                        List<NotionDatabaseMeta> databases, List<NotionCachedEvent> events,
+                        String diagnosticNote) {
             this.workspaceName = workspaceName;
             this.sources = sources;
             this.databases = databases;
             this.events = events;
+            this.diagnosticNote = diagnosticNote == null ? "" : diagnosticNote;
+        }
+
+        public int countEventsForSource(String sourceKey) {
+            int count = 0;
+            for (NotionCachedEvent ev : events) {
+                if (sourceKey.equals(ev.sourceKey)) count++;
+            }
+            return count;
         }
     }
 
@@ -259,14 +279,6 @@ public final class NotionManager {
         cachedWorkspace = null;
     }
 
-    public static String getWorkspaceName(Context context) {
-        CachedWorkspace ws = loadCache(context);
-        if (ws != null && !TextUtils.isEmpty(ws.workspaceName)) {
-            return ws.workspaceName;
-        }
-        return prefs(context).getString(KEY_WORKSPACE_NAME, "Notion");
-    }
-
     public static long getLastSyncMillis(Context context) {
         return prefs(context).getLong(KEY_LAST_SYNC_MS, 0L);
     }
@@ -281,30 +293,26 @@ public final class NotionManager {
     }
 
     /**
-     * Full workspace discovery + event sync (called when user clicks Connect/Rescan in MainActivity).
+     * Full workspace discovery + event sync.
      */
     public static void scanWorkspaceAndSyncAsync(Context context, SyncCallback callback) {
         final Context appContext = context.getApplicationContext();
         EXECUTOR.execute(() -> {
             if (!SYNC_IN_PROGRESS.compareAndSet(false, true)) {
-                if (callback != null) {
-                    MAIN_HANDLER.post(() -> callback.onError("正在同步 Notion 中，請稍候…"));
-                }
+                postErr(callback, "正在同步 Notion 中，請稍候…");
                 return;
             }
             try {
                 String token = getToken(appContext);
                 if (token.isEmpty()) {
-                    if (callback != null) {
-                        MAIN_HANDLER.post(() -> callback.onError("請先貼上 Notion Integration Secret Token"));
-                    }
+                    postErr(callback, "請先貼上 Notion Integration Secret Token");
                     return;
                 }
 
-                // 1. Verify token & fetch workspace name
-                HttpResult meRes = requestNotion(token, "GET", "/users/me", null);
+                // 1. Verify token & resolve workspace name + owner user UUID (for "me" filters)
+                HttpResult meRes = requestNotion(token, "GET", "/users/me", null, null);
                 if (meRes.code == 401) {
-                    postErr(callback, "Notion Token 無效 (HTTP 401)，請確認已複製完整的 Internal Integration Secret");
+                    postErr(callback, "Notion Token 無效 (HTTP 401)，請確認複製了正確的 Internal Integration Secret");
                     return;
                 }
                 if (meRes.code != 200) {
@@ -314,14 +322,24 @@ public final class NotionManager {
 
                 JSONObject meJson = new JSONObject(meRes.body);
                 String workspaceName = "Notion";
+                String ownerUserId = "";
                 JSONObject botObj = meJson.optJSONObject("bot");
-                if (botObj != null && !TextUtils.isEmpty(botObj.optString("workspace_name"))) {
-                    workspaceName = botObj.optString("workspace_name");
+                if (botObj != null) {
+                    if (!TextUtils.isEmpty(botObj.optString("workspace_name"))) {
+                        workspaceName = botObj.optString("workspace_name");
+                    }
+                    JSONObject owner = botObj.optJSONObject("owner");
+                    if (owner != null && "user".equals(owner.optString("type"))) {
+                        JSONObject u = owner.optJSONObject("user");
+                        if (u != null) ownerUserId = optCleanString(u, "id");
+                    }
                 } else if (!TextUtils.isEmpty(meJson.optString("name"))) {
                     workspaceName = meJson.optString("name");
                 }
+                if (ownerUserId.isEmpty()) {
+                    ownerUserId = discoverFirstPersonUserId(token);
+                }
 
-                // Preserve existing custom sources
                 CachedWorkspace oldCache = loadCache(appContext);
                 List<NotionSource> preservedCustom = new ArrayList<>();
                 if (oldCache != null) {
@@ -330,201 +348,50 @@ public final class NotionManager {
                     }
                 }
 
-                // 2. Discover all shared data_sources
-                List<JSONObject> rawDataSources = fetchAllDataSources(token);
+                // 2. Multi-pronged discovery of all accessible data_sources & linked views
                 Map<String, JSONObject> dbContainerCache = new HashMap<>();
+                List<JSONObject> rawDataSources = discoverAllDataSources(token, dbContainerCache);
 
                 List<NotionDatabaseMeta> discoveredDbs = new ArrayList<>();
                 List<NotionSource> discoveredSources = new ArrayList<>();
                 int colorCounter = 0;
 
                 for (JSONObject ds : rawDataSources) {
-                    if (ds.optBoolean("in_trash", false) || ds.optBoolean("is_archived", false)) {
+                    if (ds.optBoolean("in_trash", false) || ds.optBoolean("is_archived", false)
+                            || ds.optBoolean("archived", false)) {
                         continue;
                     }
-                    String dsId = ds.optString("id", "");
+                    String dsId = optCleanString(ds, "id");
                     if (dsId.isEmpty()) continue;
 
-                    String dbId = "";
-                    JSONObject parent = ds.optJSONObject("parent");
-                    if (parent != null && "database_id".equals(parent.optString("type"))) {
-                        dbId = parent.optString("database_id", "");
-                    }
-
-                    String dsTitle = extractPlainText(ds.optJSONArray("title")).trim();
-                    String iconEmoji = extractEmoji(ds.optJSONObject("icon"));
-
-                    if (!dbId.isEmpty() && (dsTitle.isEmpty() || "Default".equalsIgnoreCase(dsTitle) || iconEmoji.isEmpty())) {
-                        JSONObject dbObj = dbContainerCache.get(dbId);
-                        if (dbObj == null) {
-                            HttpResult dbRes = requestNotion(token, "GET", "/databases/" + dbId, null);
-                            if (dbRes.code == 200) {
-                                dbObj = new JSONObject(dbRes.body);
-                                dbContainerCache.put(dbId, dbObj);
-                            }
-                        }
-                        if (dbObj != null) {
-                            String containerTitle = extractPlainText(dbObj.optJSONArray("title")).trim();
-                            String containerEmoji = extractEmoji(dbObj.optJSONObject("icon"));
-                            if (!containerTitle.isEmpty()) {
-                                if (dsTitle.isEmpty() || "Default".equalsIgnoreCase(dsTitle) || dsTitle.equals(containerTitle)) {
-                                    dsTitle = containerTitle;
-                                } else {
-                                    dsTitle = containerTitle + " · " + dsTitle;
-                                }
-                            }
-                            if (iconEmoji.isEmpty() && !containerEmoji.isEmpty()) {
-                                iconEmoji = containerEmoji;
-                            }
-                        }
-                    }
-                    if (dsTitle.isEmpty()) dsTitle = "未命名資料庫";
-
-                    JSONObject propsObj = ds.optJSONObject("properties");
-                    if (propsObj == null || propsObj.length() == 0) {
-                        HttpResult fullDsRes = requestNotion(token, "GET", "/data_sources/" + dsId, null);
-                        if (fullDsRes.code == 200) {
-                            JSONObject fullDs = new JSONObject(fullDsRes.body);
-                            propsObj = fullDs.optJSONObject("properties");
-                        }
-                    }
-                    if (propsObj == null) continue;
-
-                    // Parse date-capable properties
-                    List<DatePropOption> primaryDateProps = new ArrayList<>();
-                    List<DatePropOption> allDateCapableProps = new ArrayList<>();
-                    Map<String, DatePropOption> propLookup = new HashMap<>();
-
-                    Iterator<String> keys = propsObj.keys();
-                    while (keys.hasNext()) {
-                        String propName = keys.next();
-                        JSONObject p = propsObj.optJSONObject(propName);
-                        if (p == null) continue;
-                        String pType = p.optString("type", "");
-                        String pId = p.optString("id", propName);
-                        if ("date".equals(pType) || "created_time".equals(pType) || "last_edited_time".equals(pType)) {
-                            DatePropOption opt = new DatePropOption(pId, propName, pType);
-                            allDateCapableProps.add(opt);
-                            propLookup.put(pId, opt);
-                            propLookup.put(decodePropId(pId), opt);
-                            propLookup.put(propName, opt);
-                            if ("date".equals(pType)) {
-                                primaryDateProps.add(opt);
-                            }
-                        }
-                    }
-
-                    if (allDateCapableProps.isEmpty()) continue;
-
-                    // Discover views on this data_source / database
-                    List<ViewOption> allViews = fetchViewsForDataSource(token, dsId, dbId);
-                    List<ViewOption> calOrTimelineViews = new ArrayList<>();
-                    for (ViewOption v : allViews) {
-                        if ("calendar".equals(v.type) || "timeline".equals(v.type)) {
-                            calOrTimelineViews.add(v);
-                        }
-                    }
-
-                    // Only treat as a Notion Calendar database if it has at least one `date` property
-                    // OR an explicit calendar/timeline view.
-                    if (primaryDateProps.isEmpty() && calOrTimelineViews.isEmpty()) {
-                        continue;
-                    }
-
-                    discoveredDbs.add(new NotionDatabaseMeta(
-                            dsId, dbId, dsTitle, iconEmoji, allDateCapableProps, allViews));
-
-                    if (!calOrTimelineViews.isEmpty()) {
-                        boolean multipleCalViews = calOrTimelineViews.size() > 1;
-                        for (int idx = 0; idx < calOrTimelineViews.size(); idx++) {
-                            ViewOption v = calOrTimelineViews.get(idx);
-                            DatePropOption resolvedStart = resolveDateProp(v.datePropId, propLookup, primaryDateProps, allDateCapableProps);
-                            if (resolvedStart == null) continue;
-                            DatePropOption resolvedEnd = !TextUtils.isEmpty(v.endDatePropId)
-                                    ? propLookup.get(v.endDatePropId) : null;
-                            if (resolvedEnd == null && !TextUtils.isEmpty(v.endDatePropId)) {
-                                resolvedEnd = propLookup.get(decodePropId(v.endDatePropId));
-                            }
-
-                            String viewLabel = v.name == null ? "" : v.name.trim();
-                            String displayName;
-                            String shortLabel;
-                            if (multipleCalViews) {
-                                String suffix = !viewLabel.isEmpty() ? viewLabel : ("檢視 " + (idx + 1));
-                                displayName = dsTitle + " · " + suffix;
-                                shortLabel = dsTitle + " (" + suffix + ")";
-                            } else if (!TextUtils.isEmpty(v.filterJson) && !isGenericViewName(viewLabel, dsTitle)) {
-                                displayName = dsTitle + " · " + viewLabel;
-                                shortLabel = dsTitle;
-                            } else {
-                                displayName = dsTitle;
-                                shortLabel = dsTitle;
-                            }
-
-                            discoveredSources.add(new NotionSource(
-                                    "notion:view:" + v.id,
-                                    dsId,
-                                    dbId,
-                                    v.id,
-                                    v.type,
-                                    displayName,
-                                    shortLabel,
-                                    iconEmoji,
-                                    resolvedStart.id,
-                                    resolvedStart.name,
-                                    resolvedStart.type,
-                                    resolvedEnd != null ? resolvedEnd.name : "",
-                                    v.filterJson,
-                                    colorCounter++,
-                                    false
-                            ));
-                        }
-                    } else {
-                        boolean multiDate = primaryDateProps.size() > 1;
-                        for (DatePropOption dp : primaryDateProps) {
-                            String displayName = multiDate ? (dsTitle + " · " + dp.name) : dsTitle;
-                            discoveredSources.add(new NotionSource(
-                                    "notion:ds:" + dsId + ":" + dp.id,
-                                    dsId,
-                                    dbId,
-                                    "",
-                                    "database",
-                                    displayName,
-                                    dsTitle,
-                                    iconEmoji,
-                                    dp.id,
-                                    dp.name,
-                                    dp.type,
-                                    "",
-                                    "",
-                                    colorCounter++,
-                                    false
-                            ));
-                        }
+                    BuildDbResult built = buildMetaAndSourcesForDataSource(
+                            token, ds, dbContainerCache, colorCounter);
+                    if (built != null) {
+                        discoveredDbs.add(built.meta);
+                        discoveredSources.addAll(built.sources);
+                        colorCounter = built.nextColorCounter;
                     }
                 }
 
-                // Append preserved custom sources whose dataSource still exists
-                Set<String> validDsIds = new HashSet<>();
-                for (NotionDatabaseMeta m : discoveredDbs) validDsIds.add(m.dataSourceId);
+                // Re-attach preserved custom/URL-added sources
                 Set<String> existingKeys = new HashSet<>();
                 for (NotionSource s : discoveredSources) existingKeys.add(s.sourceKey);
                 for (NotionSource custom : preservedCustom) {
-                    if (validDsIds.contains(custom.dataSourceId) && !existingKeys.contains(custom.sourceKey)) {
+                    if (!existingKeys.contains(custom.sourceKey)) {
                         discoveredSources.add(custom);
                         existingKeys.add(custom.sourceKey);
                     }
                 }
 
-                // 3. Query events for all visible NotionSources
-                Set<String> hidden = CalendarWidgetProvider.hiddenCalendars(appContext);
-                List<NotionCachedEvent> events = queryEventsForSources(token, discoveredSources, hidden);
+                // 3. Query events for all NotionSources visible on at least one widget
+                QueryBatchResult qRes = queryEventsForSources(appContext, token, ownerUserId, discoveredSources);
 
-                // 4. Persist cache & update widget
-                CachedWorkspace newWs = new CachedWorkspace(workspaceName, discoveredSources, discoveredDbs, events);
+                CachedWorkspace newWs = new CachedWorkspace(
+                        workspaceName, discoveredSources, discoveredDbs, qRes.events, qRes.diagnosticNote);
                 saveCache(appContext, newWs);
                 prefs(appContext).edit()
                         .putString(KEY_WORKSPACE_NAME, workspaceName)
+                        .putString(KEY_OWNER_USER_ID, ownerUserId)
                         .putLong(KEY_LAST_SYNC_MS, System.currentTimeMillis())
                         .apply();
 
@@ -532,7 +399,7 @@ public final class NotionManager {
 
                 final String finalWsName = workspaceName;
                 final int srcCount = discoveredSources.size();
-                final int evCount = events.size();
+                final int evCount = qRes.events.size();
                 if (callback != null) {
                     MAIN_HANDLER.post(() -> callback.onSuccess(finalWsName, srcCount, evCount));
                 }
@@ -545,8 +412,466 @@ public final class NotionManager {
     }
 
     /**
-     * Adds a user-configured custom View + Date property combination and syncs immediately.
+     * Directly adds a Notion database by pasted Notion URL or 32-char ID (bypasses search index lag).
      */
+    public static void addDatabaseByUrlOrIdAsync(Context context, String rawInput, SyncCallback callback) {
+        final Context appContext = context.getApplicationContext();
+        EXECUTOR.execute(() -> {
+            String token = getToken(appContext);
+            if (token.isEmpty()) {
+                postErr(callback, "請先貼上 Notion Token 並儲存");
+                return;
+            }
+            String extractedId = extractNotionUuid(rawInput);
+            if (extractedId.isEmpty()) {
+                postErr(callback, "無法從輸入內容辨識出 32 碼 Notion 資料庫網址或 ID");
+                return;
+            }
+
+            if (!SYNC_IN_PROGRESS.compareAndSet(false, true)) {
+                postErr(callback, "正在同步 Notion 中，請稍候…");
+                return;
+            }
+            try {
+                Map<String, JSONObject> dbCache = new HashMap<>();
+                List<JSONObject> targetDataSources = new ArrayList<>();
+
+                // Try as database_id first (most Notion URLs contain database_id before ?v=...)
+                HttpResult dbRes = requestNotion(token, "GET", "/databases/" + extractedId, null, null);
+                if (dbRes.code == 200) {
+                    JSONObject dbObj = new JSONObject(dbRes.body);
+                    dbCache.put(formatUuid(extractedId), dbObj);
+                    dbCache.put(extractedId, dbObj);
+                    JSONArray dsStubs = dbObj.optJSONArray("data_sources");
+                    if (dsStubs != null && dsStubs.length() > 0) {
+                        for (int i = 0; i < dsStubs.length(); i++) {
+                            String dsId = dsStubs.getJSONObject(i).optString("id", "");
+                            if (!dsId.isEmpty()) {
+                                HttpResult dsRes = requestNotion(token, "GET", "/data_sources/" + dsId, null, null);
+                                if (dsRes.code == 200) {
+                                    targetDataSources.add(new JSONObject(dsRes.body));
+                                }
+                            }
+                        }
+                    }
+                } else if (dbRes.code == 403) {
+                    postErr(callback, "權限不足 (HTTP 403)：請到 Notion Integration 設定確認已開啟「Read content（讀取內容）」權限！");
+                    return;
+                }
+
+                // Also try directly as data_source_id
+                if (targetDataSources.isEmpty()) {
+                    HttpResult dsRes = requestNotion(token, "GET", "/data_sources/" + extractedId, null, null);
+                    if (dsRes.code == 200) {
+                        targetDataSources.add(new JSONObject(dsRes.body));
+                    } else if (dbRes.code == 404) {
+                        postErr(callback, "Notion 回傳找不到此資料庫 (HTTP 404)！\n這代表該「原始資料庫」尚未授權給你的 Integration。\n請在 Notion 打開該資料庫本體 → 右上角「•••」→「Connections」加入你的 Integration，或到 Notion Integration 的「Access」分頁勾選它！");
+                        return;
+                    } else {
+                        postErr(callback, "讀取資料庫失敗 (HTTP " + dbRes.code + ")：" + dbRes.errorMsg);
+                        return;
+                    }
+                }
+
+                CachedWorkspace ws = loadCache(appContext);
+                String wsName = ws != null ? ws.workspaceName : prefs(appContext).getString(KEY_WORKSPACE_NAME, "Notion");
+                List<NotionDatabaseMeta> dbs = ws != null ? new ArrayList<>(ws.databases) : new ArrayList<>();
+                List<NotionSource> sources = ws != null ? new ArrayList<>(ws.sources) : new ArrayList<>();
+                Set<String> existingKeys = new HashSet<>();
+                for (NotionSource s : sources) existingKeys.add(s.sourceKey);
+                Set<String> existingDsIds = new HashSet<>();
+                for (NotionDatabaseMeta m : dbs) existingDsIds.add(normalizeUuid(m.dataSourceId));
+
+                int addedCount = 0;
+                int colorCounter = sources.size();
+                for (JSONObject ds : targetDataSources) {
+                    BuildDbResult built = buildMetaAndSourcesForDataSource(token, ds, dbCache, colorCounter);
+                    if (built == null) continue;
+                    colorCounter = built.nextColorCounter;
+                    if (!existingDsIds.contains(normalizeUuid(built.meta.dataSourceId))) {
+                        dbs.add(built.meta);
+                        existingDsIds.add(normalizeUuid(built.meta.dataSourceId));
+                    }
+                    for (NotionSource s : built.sources) {
+                        NotionSource asCustom = new NotionSource(
+                                s.sourceKey, s.dataSourceId, s.databaseId, s.viewId, s.viewType,
+                                s.displayName, s.shortLabel, s.iconEmoji, s.datePropId, s.datePropName,
+                                s.datePropType, s.endDatePropName, s.filterJson, s.defaultColorIndex, true);
+                        if (existingKeys.add(asCustom.sourceKey)) {
+                            sources.add(asCustom);
+                            addedCount++;
+                        }
+                    }
+                }
+
+                if (addedCount == 0 && existingKeys.isEmpty()) {
+                    postErr(callback, "此資料庫中沒有找到可用的日期欄位");
+                    return;
+                }
+
+                String ownerUserId = prefs(appContext).getString(KEY_OWNER_USER_ID, "");
+                QueryBatchResult qRes = queryEventsForSources(appContext, token, ownerUserId, sources);
+                CachedWorkspace updated = new CachedWorkspace(wsName, sources, dbs, qRes.events, qRes.diagnosticNote);
+                saveCache(appContext, updated);
+                prefs(appContext).edit().putLong(KEY_LAST_SYNC_MS, System.currentTimeMillis()).apply();
+                CalendarWidgetProvider.updateAll(appContext);
+
+                final int totalSrc = sources.size();
+                final int totalEv = qRes.events.size();
+                if (callback != null) {
+                    MAIN_HANDLER.post(() -> callback.onSuccess(wsName, totalSrc, totalEv));
+                }
+            } catch (Exception e) {
+                postErr(callback, "加入資料庫失敗：" + e.getMessage());
+            } finally {
+                SYNC_IN_PROGRESS.set(false);
+            }
+        });
+    }
+
+    private static final class BuildDbResult {
+        final NotionDatabaseMeta meta;
+        final List<NotionSource> sources;
+        final int nextColorCounter;
+
+        BuildDbResult(NotionDatabaseMeta meta, List<NotionSource> sources, int nextColorCounter) {
+            this.meta = meta;
+            this.sources = sources;
+            this.nextColorCounter = nextColorCounter;
+        }
+    }
+
+    private static BuildDbResult buildMetaAndSourcesForDataSource(
+            String token,
+            JSONObject ds,
+            Map<String, JSONObject> dbContainerCache,
+            int colorCounter) throws Exception {
+
+        String dsId = optCleanString(ds, "id");
+        if (dsId.isEmpty()) return null;
+
+        String dbId = "";
+        JSONObject parent = ds.optJSONObject("parent");
+        if (parent != null) {
+            dbId = optCleanString(parent, "database_id");
+        }
+
+        String dsTitle = extractPlainText(ds.optJSONArray("title")).trim();
+        String iconEmoji = extractEmoji(ds.optJSONObject("icon"));
+
+        if (!dbId.isEmpty() && (dsTitle.isEmpty() || "Default".equalsIgnoreCase(dsTitle) || iconEmoji.isEmpty())) {
+            JSONObject dbObj = dbContainerCache.get(dbId);
+            if (dbObj == null) {
+                HttpResult dbRes = requestNotion(token, "GET", "/databases/" + dbId, null, null);
+                if (dbRes.code == 200) {
+                    dbObj = new JSONObject(dbRes.body);
+                    dbContainerCache.put(dbId, dbObj);
+                }
+            }
+            if (dbObj != null) {
+                String containerTitle = extractPlainText(dbObj.optJSONArray("title")).trim();
+                String containerEmoji = extractEmoji(dbObj.optJSONObject("icon"));
+                if (!containerTitle.isEmpty()) {
+                    if (dsTitle.isEmpty() || "Default".equalsIgnoreCase(dsTitle) || dsTitle.equals(containerTitle)) {
+                        dsTitle = containerTitle;
+                    } else {
+                        dsTitle = containerTitle + " · " + dsTitle;
+                    }
+                }
+                if (iconEmoji.isEmpty() && !containerEmoji.isEmpty()) {
+                    iconEmoji = containerEmoji;
+                }
+            }
+        }
+        if (dsTitle.isEmpty()) dsTitle = "未命名資料庫";
+
+        JSONObject propsObj = ds.optJSONObject("properties");
+        if (propsObj == null || propsObj.length() == 0) {
+            HttpResult fullDsRes = requestNotion(token, "GET", "/data_sources/" + dsId, null, null);
+            if (fullDsRes.code == 200) {
+                propsObj = new JSONObject(fullDsRes.body).optJSONObject("properties");
+            }
+        }
+        if (propsObj == null) return null;
+
+        List<DatePropOption> primaryDateProps = new ArrayList<>();
+        List<DatePropOption> formulaOrRollupProps = new ArrayList<>();
+        List<DatePropOption> allDateCapableProps = new ArrayList<>();
+        Map<String, DatePropOption> propLookup = new HashMap<>();
+
+        Iterator<String> keys = propsObj.keys();
+        while (keys.hasNext()) {
+            String propName = keys.next();
+            JSONObject p = propsObj.optJSONObject(propName);
+            if (p == null) continue;
+            String pType = p.optString("type", "");
+            String pId = p.optString("id", propName);
+            if ("date".equals(pType) || "formula".equals(pType) || "rollup".equals(pType)
+                    || "created_time".equals(pType) || "last_edited_time".equals(pType)) {
+                DatePropOption opt = new DatePropOption(pId, propName, pType);
+                allDateCapableProps.add(opt);
+                propLookup.put(pId, opt);
+                propLookup.put(decodePropId(pId), opt);
+                propLookup.put(propName, opt);
+                if ("date".equals(pType)) {
+                    primaryDateProps.add(opt);
+                } else if ("formula".equals(pType) || "rollup".equals(pType)) {
+                    formulaOrRollupProps.add(opt);
+                }
+            }
+        }
+
+        if (allDateCapableProps.isEmpty()) return null;
+
+        List<ViewOption> allViews = fetchViewsForDataSource(token, dsId, dbId);
+        List<ViewOption> calOrTimelineViews = new ArrayList<>();
+        for (ViewOption v : allViews) {
+            if ("calendar".equals(v.type) || "timeline".equals(v.type)) {
+                calOrTimelineViews.add(v);
+            }
+        }
+
+        // Accept if database has at least one `date` property OR an explicit calendar/timeline view
+        if (primaryDateProps.isEmpty() && calOrTimelineViews.isEmpty()) {
+            return null;
+        }
+
+        NotionDatabaseMeta meta = new NotionDatabaseMeta(
+                dsId, dbId, dsTitle, iconEmoji, allDateCapableProps, allViews);
+        List<NotionSource> sources = new ArrayList<>();
+
+        if (!calOrTimelineViews.isEmpty()) {
+            boolean multipleCalViews = calOrTimelineViews.size() > 1;
+            for (int idx = 0; idx < calOrTimelineViews.size(); idx++) {
+                ViewOption v = calOrTimelineViews.get(idx);
+                DatePropOption resolvedStart = resolveDateProp(
+                        v.datePropId, propLookup, primaryDateProps, formulaOrRollupProps, allDateCapableProps);
+                if (resolvedStart == null) continue;
+                DatePropOption resolvedEnd = !TextUtils.isEmpty(v.endDatePropId)
+                        ? propLookup.get(v.endDatePropId) : null;
+                if (resolvedEnd == null && !TextUtils.isEmpty(v.endDatePropId)) {
+                    resolvedEnd = propLookup.get(decodePropId(v.endDatePropId));
+                }
+
+                String viewLabel = v.name == null ? "" : v.name.trim();
+                String displayName;
+                String shortLabel;
+                if (multipleCalViews) {
+                    String suffix = !viewLabel.isEmpty() ? viewLabel : ("檢視 " + (idx + 1));
+                    displayName = dsTitle + " · " + suffix;
+                    shortLabel = dsTitle + " (" + suffix + ")";
+                } else if (!TextUtils.isEmpty(v.filterJson) && !isGenericViewName(viewLabel, dsTitle)) {
+                    displayName = dsTitle + " · " + viewLabel;
+                    shortLabel = dsTitle;
+                } else {
+                    displayName = dsTitle;
+                    shortLabel = dsTitle;
+                }
+
+                sources.add(new NotionSource(
+                        "notion:view:" + v.id,
+                        dsId,
+                        dbId,
+                        v.id,
+                        v.type,
+                        displayName,
+                        shortLabel,
+                        iconEmoji,
+                        resolvedStart.id,
+                        resolvedStart.name,
+                        resolvedStart.type,
+                        resolvedEnd != null ? resolvedEnd.name : "",
+                        v.filterJson,
+                        colorCounter++,
+                        false
+                ));
+            }
+        } else {
+            boolean multiDate = primaryDateProps.size() > 1;
+            for (DatePropOption dp : primaryDateProps) {
+                String displayName = multiDate ? (dsTitle + " · " + dp.name) : dsTitle;
+                sources.add(new NotionSource(
+                        "notion:ds:" + dsId + ":" + dp.id,
+                        dsId,
+                        dbId,
+                        "",
+                        "database",
+                        displayName,
+                        dsTitle,
+                        iconEmoji,
+                        dp.id,
+                        dp.name,
+                        dp.type,
+                        "",
+                        "",
+                        colorCounter++,
+                        false
+                ));
+            }
+        }
+
+        return new BuildDbResult(meta, sources, colorCounter);
+    }
+
+    /**
+     * Multi-pronged discovery:
+     * 1. POST /search (2026-03-11, filter=data_source)
+     * 2. POST /search (2026-03-11, filter=page) -> inspect parent data_source_id/database_id
+     *    + crawl child_database blocks on shared dashboard/parent pages!
+     * 3. Fallback POST /search (2022-06-28, filter=database) -> GET /databases/{id}
+     */
+    private static List<JSONObject> discoverAllDataSources(
+            String token, Map<String, JSONObject> dbContainerCache) throws Exception {
+        LinkedHashMap<String, JSONObject> byDsId = new LinkedHashMap<>();
+        Set<String> extraDbIdsToResolve = new HashSet<>();
+        Set<String> extraDsIdsToResolve = new HashSet<>();
+
+        // Prong 1: Standard 2026-03-11 data_source search
+        String nextCursor = null;
+        for (int page = 0; page < 5; page++) {
+            JSONObject body = new JSONObject();
+            body.put("filter", new JSONObject().put("property", "object").put("value", "data_source"));
+            body.put("page_size", 100);
+            if (!TextUtils.isEmpty(nextCursor)) body.put("start_cursor", nextCursor);
+
+            HttpResult res = requestNotion(token, "POST", "/search", body.toString(), null);
+            if (res.code != 200) break;
+
+            JSONObject json = new JSONObject(res.body);
+            JSONArray results = json.optJSONArray("results");
+            if (results != null) {
+                for (int i = 0; i < results.length(); i++) {
+                    JSONObject item = results.optJSONObject(i);
+                    if (item != null && "data_source".equals(item.optString("object"))) {
+                        String id = optCleanString(item, "id");
+                        if (!id.isEmpty()) byDsId.put(normalizeUuid(id), item);
+                    }
+                }
+            }
+            if (!json.optBoolean("has_more", false)) break;
+            nextCursor = optCleanString(json, "next_cursor");
+            if (nextCursor.isEmpty()) break;
+        }
+
+        // Prong 2: Page search -> catch parent data_sources + child_database blocks inside shared parent pages
+        HttpResult pageSearch = requestNotion(token, "POST", "/search",
+                new JSONObject()
+                        .put("filter", new JSONObject().put("property", "object").put("value", "page"))
+                        .put("page_size", 100)
+                        .toString(),
+                null);
+        if (pageSearch.code == 200) {
+            JSONArray pages = new JSONObject(pageSearch.body).optJSONArray("results");
+            if (pages != null) {
+                List<String> standalonePagesToCrawl = new ArrayList<>();
+                for (int i = 0; i < pages.length(); i++) {
+                    JSONObject p = pages.optJSONObject(i);
+                    if (p == null || p.optBoolean("in_trash", false) || p.optBoolean("archived", false)) continue;
+                    JSONObject parent = p.optJSONObject("parent");
+                    if (parent == null) continue;
+                    String pType = parent.optString("type", "");
+                    String pDsId = optCleanString(parent, "data_source_id");
+                    String pDbId = optCleanString(parent, "database_id");
+                    if (!pDsId.isEmpty() && !byDsId.containsKey(normalizeUuid(pDsId))) {
+                        extraDsIdsToResolve.add(pDsId);
+                    } else if (!pDbId.isEmpty()) {
+                        extraDbIdsToResolve.add(pDbId);
+                    } else if ("workspace".equals(pType) || "page_id".equals(pType)) {
+                        if (standalonePagesToCrawl.size() < 12) {
+                            standalonePagesToCrawl.add(optCleanString(p, "id"));
+                        }
+                    }
+                }
+
+                // Crawl top-level shared pages for inline/linked child_database blocks
+                for (String pageId : standalonePagesToCrawl) {
+                    if (pageId.isEmpty()) continue;
+                    HttpResult blkRes = requestNotion(token, "GET",
+                            "/blocks/" + pageId + "/children?page_size=100", null, null);
+                    if (blkRes.code != 200) continue;
+                    JSONArray blocks = new JSONObject(blkRes.body).optJSONArray("results");
+                    if (blocks == null) continue;
+                    for (int b = 0; b < blocks.length(); b++) {
+                        JSONObject blk = blocks.optJSONObject(b);
+                        if (blk == null) continue;
+                        if ("child_database".equals(blk.optString("type"))) {
+                            String childDbId = optCleanString(blk, "id");
+                            if (!childDbId.isEmpty()) {
+                                extraDbIdsToResolve.add(childDbId);
+                                // Also check views on linked database blocks!
+                                HttpResult vRes = requestNotion(token, "GET",
+                                        "/views?database_id=" + childDbId + "&page_size=20", null, null);
+                                if (vRes.code == 200) {
+                                    JSONArray vStubs = new JSONObject(vRes.body).optJSONArray("results");
+                                    if (vStubs != null) {
+                                        for (int vi = 0; vi < Math.min(vStubs.length(), 10); vi++) {
+                                            String vid = vStubs.getJSONObject(vi).optString("id", "");
+                                            if (!vid.isEmpty()) {
+                                                HttpResult vd = requestNotion(token, "GET", "/views/" + vid, null, null);
+                                                if (vd.code == 200) {
+                                                    String linkedDs = optCleanString(new JSONObject(vd.body), "data_source_id");
+                                                    if (!linkedDs.isEmpty() && !byDsId.containsKey(normalizeUuid(linkedDs))) {
+                                                        extraDsIdsToResolve.add(linkedDs);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Prong 3: Legacy 2022-06-28 database search fallback if nothing found yet
+        if (byDsId.isEmpty() && extraDsIdsToResolve.isEmpty() && extraDbIdsToResolve.isEmpty()) {
+            HttpResult legRes = executeNotionHttp(token, "POST", "/search",
+                    new JSONObject()
+                            .put("filter", new JSONObject().put("property", "object").put("value", "database"))
+                            .put("page_size", 100)
+                            .toString(),
+                    NOTION_VERSION_LEGACY, null);
+            if (legRes.code == 200) {
+                JSONArray dbs = new JSONObject(legRes.body).optJSONArray("results");
+                if (dbs != null) {
+                    for (int i = 0; i < dbs.length(); i++) {
+                        String dbId = optCleanString(dbs.optJSONObject(i), "id");
+                        if (!dbId.isEmpty()) extraDbIdsToResolve.add(dbId);
+                    }
+                }
+            }
+        }
+
+        for (String dbId : extraDbIdsToResolve) {
+            HttpResult dbRes = requestNotion(token, "GET", "/databases/" + dbId, null, null);
+            if (dbRes.code == 200) {
+                JSONObject dbObj = new JSONObject(dbRes.body);
+                dbContainerCache.put(dbId, dbObj);
+                JSONArray dsArr = dbObj.optJSONArray("data_sources");
+                if (dsArr != null) {
+                    for (int i = 0; i < dsArr.length(); i++) {
+                        String dsId = optCleanString(dsArr.optJSONObject(i), "id");
+                        if (!dsId.isEmpty() && !byDsId.containsKey(normalizeUuid(dsId))) {
+                            extraDsIdsToResolve.add(dsId);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (String dsId : extraDsIdsToResolve) {
+            if (byDsId.containsKey(normalizeUuid(dsId))) continue;
+            HttpResult dsRes = requestNotion(token, "GET", "/data_sources/" + dsId, null, null);
+            if (dsRes.code == 200) {
+                byDsId.put(normalizeUuid(dsId), new JSONObject(dsRes.body));
+            }
+        }
+
+        return new ArrayList<>(byDsId.values());
+    }
+
     public static void addCustomSourceAndSync(Context context, NotionDatabaseMeta db,
                                               ViewOption viewOrNull, DatePropOption dateProp,
                                               int chosenColor, SyncCallback callback) {
@@ -580,7 +905,8 @@ public final class NotionManager {
             setSourceColor(appContext, key, chosenColor);
             List<NotionSource> updatedSources = new ArrayList<>(ws.sources);
             updatedSources.add(customSource);
-            saveCache(appContext, new CachedWorkspace(ws.workspaceName, updatedSources, ws.databases, ws.events));
+            saveCache(appContext, new CachedWorkspace(
+                    ws.workspaceName, updatedSources, ws.databases, ws.events, ws.diagnosticNote));
             refreshEventsOnlyAsync(appContext, 0L, callback);
         });
     }
@@ -596,13 +922,11 @@ public final class NotionManager {
         for (NotionCachedEvent ev : ws.events) {
             if (!ev.sourceKey.equals(sourceKey)) keptEvents.add(ev);
         }
-        saveCache(context, new CachedWorkspace(ws.workspaceName, keptSources, ws.databases, keptEvents));
+        saveCache(context, new CachedWorkspace(
+                ws.workspaceName, keptSources, ws.databases, keptEvents, ws.diagnosticNote));
         CalendarWidgetProvider.updateAll(context);
     }
 
-    /**
-     * Lightweight background event sync using already-discovered NotionSources.
-     */
     public static void refreshEventsOnlyAsync(Context context, long minIntervalMs, SyncCallback callback) {
         final Context appContext = context.getApplicationContext();
         String token = getToken(appContext);
@@ -623,32 +947,27 @@ public final class NotionManager {
                     scanWorkspaceAndSyncAsync(appContext, callback);
                     return;
                 }
-                Set<String> hidden = CalendarWidgetProvider.hiddenCalendars(appContext);
-                List<NotionCachedEvent> events = queryEventsForSources(token, ws.sources, hidden);
-                CachedWorkspace updated = new CachedWorkspace(ws.workspaceName, ws.sources, ws.databases, events);
+                String ownerUserId = prefs(appContext).getString(KEY_OWNER_USER_ID, "");
+                QueryBatchResult qRes = queryEventsForSources(appContext, token, ownerUserId, ws.sources);
+                CachedWorkspace updated = new CachedWorkspace(
+                        ws.workspaceName, ws.sources, ws.databases, qRes.events, qRes.diagnosticNote);
                 saveCache(appContext, updated);
                 prefs(appContext).edit().putLong(KEY_LAST_SYNC_MS, System.currentTimeMillis()).apply();
                 CalendarWidgetProvider.updateAll(appContext);
                 if (callback != null) {
                     final String wsName = ws.workspaceName;
                     final int sCount = ws.sources.size();
-                    final int eCount = events.size();
+                    final int eCount = qRes.events.size();
                     MAIN_HANDLER.post(() -> callback.onSuccess(wsName, sCount, eCount));
                 }
             } catch (Exception e) {
-                if (callback != null) {
-                    postErr(callback, "同步 Notion 行程失敗：" + e.getMessage());
-                }
+                postErr(callback, "同步 Notion 行程失敗：" + e.getMessage());
             } finally {
                 SYNC_IN_PROGRESS.set(false);
             }
         });
     }
 
-    /**
-     * Fast in-memory/local-disk lookup for CalendarWidgetProvider.loadEvents().
-     * Never performs network I/O on the widget binder thread.
-     */
     public static List<CalendarWidgetProvider.Event> loadEventsForDay(
             Context context,
             LocalDate day,
@@ -748,6 +1067,7 @@ public final class NotionManager {
             }
             JSONObject root = new JSONObject(sb.toString());
             String wsName = root.optString("workspaceName", "Notion");
+            String diag = root.optString("diagnosticNote", "");
 
             List<NotionSource> sources = new ArrayList<>();
             JSONArray sArr = root.optJSONArray("sources");
@@ -834,7 +1154,7 @@ public final class NotionManager {
                 }
             }
 
-            CachedWorkspace parsed = new CachedWorkspace(wsName, sources, dbs, events);
+            CachedWorkspace parsed = new CachedWorkspace(wsName, sources, dbs, events, diag);
             cachedWorkspace = parsed;
             cachedFileMtime = mtime;
             return parsed;
@@ -847,6 +1167,7 @@ public final class NotionManager {
         try {
             JSONObject root = new JSONObject();
             root.put("workspaceName", ws.workspaceName);
+            root.put("diagnosticNote", ws.diagnosticNote);
 
             JSONArray sArr = new JSONArray();
             for (NotionSource s : ws.sources) {
@@ -939,46 +1260,14 @@ public final class NotionManager {
         }
     }
 
-    private static List<JSONObject> fetchAllDataSources(String token) throws Exception {
-        List<JSONObject> list = new ArrayList<>();
-        String nextCursor = null;
-        for (int page = 0; page < 5; page++) {
-            JSONObject body = new JSONObject();
-            JSONObject filter = new JSONObject();
-            filter.put("property", "object");
-            filter.put("value", "data_source");
-            body.put("filter", filter);
-            body.put("page_size", 100);
-            if (!TextUtils.isEmpty(nextCursor)) {
-                body.put("start_cursor", nextCursor);
-            }
-
-            HttpResult res = requestNotion(token, "POST", "/search", body.toString());
-            if (res.code != 200) break;
-
-            JSONObject json = new JSONObject(res.body);
-            JSONArray results = json.optJSONArray("results");
-            if (results != null) {
-                for (int i = 0; i < results.length(); i++) {
-                    JSONObject item = results.optJSONObject(i);
-                    if (item != null && "data_source".equals(item.optString("object"))) {
-                        list.add(item);
-                    }
-                }
-            }
-            if (!json.optBoolean("has_more", false)) break;
-            nextCursor = json.optString("next_cursor", "");
-            if (TextUtils.isEmpty(nextCursor) || "null".equals(nextCursor)) break;
-        }
-        return list;
-    }
-
     private static List<ViewOption> fetchViewsForDataSource(String token, String dsId, String dbId) {
         List<ViewOption> out = new ArrayList<>();
         try {
-            HttpResult listRes = requestNotion(token, "GET", "/views?data_source_id=" + dsId + "&page_size=50", null);
+            HttpResult listRes = requestNotion(token, "GET",
+                    "/views?data_source_id=" + dsId + "&page_size=50", null, BETA_STATUS_GROUP);
             if ((listRes.code != 200 || countResults(listRes.body) == 0) && !TextUtils.isEmpty(dbId)) {
-                listRes = requestNotion(token, "GET", "/views?database_id=" + dbId + "&page_size=50", null);
+                listRes = requestNotion(token, "GET",
+                        "/views?database_id=" + dbId + "&page_size=50", null, BETA_STATUS_GROUP);
             }
             if (listRes.code != 200) return out;
 
@@ -991,15 +1280,15 @@ public final class NotionManager {
             for (int i = 0; i < limit; i++) {
                 JSONObject stub = stubs.optJSONObject(i);
                 if (stub == null) continue;
-                String viewId = stub.optString("id", "");
+                String viewId = optCleanString(stub, "id");
                 if (viewId.isEmpty() || dedup.containsKey(viewId)) continue;
 
-                HttpResult vRes = requestNotion(token, "GET", "/views/" + viewId, null);
+                HttpResult vRes = requestNotion(token, "GET", "/views/" + viewId, null, BETA_STATUS_GROUP);
                 if (vRes.code != 200) continue;
 
                 JSONObject vObj = new JSONObject(vRes.body);
-                String vDsId = vObj.optString("data_source_id", "");
-                if (!vDsId.isEmpty() && !"null".equals(vDsId) && !normalizeUuid(vDsId).equals(normalizeUuid(dsId))) {
+                String vDsId = optCleanString(vObj, "data_source_id");
+                if (!vDsId.isEmpty() && !normalizeUuid(vDsId).equals(normalizeUuid(dsId))) {
                     continue;
                 }
                 String vType = vObj.optString("type", "");
@@ -1011,13 +1300,11 @@ public final class NotionManager {
                 String endDatePropId = "";
                 JSONObject cfg = vObj.optJSONObject("configuration");
                 if (cfg != null) {
-                    datePropId = cfg.optString("date_property_id", "");
-                    if ("null".equals(datePropId)) datePropId = "";
-                    endDatePropId = cfg.optString("end_date_property_id", "");
-                    if ("null".equals(endDatePropId)) endDatePropId = "";
+                    datePropId = optCleanString(cfg, "date_property_id");
+                    endDatePropId = optCleanString(cfg, "end_date_property_id");
                 }
                 JSONObject filterObj = vObj.optJSONObject("filter");
-                String filterStr = filterObj != null ? filterObj.toString() : "";
+                String filterStr = (filterObj != null && filterObj.length() > 0) ? filterObj.toString() : "";
 
                 dedup.put(viewId, new ViewOption(viewId, vName, vType, datePropId, endDatePropId, filterStr));
             }
@@ -1027,102 +1314,275 @@ public final class NotionManager {
         return out;
     }
 
-    private static List<NotionCachedEvent> queryEventsForSources(
-            String token, List<NotionSource> sources, Set<String> hiddenCalendars) {
+    private static final class QueryBatchResult {
+        final List<NotionCachedEvent> events;
+        final String diagnosticNote;
+
+        QueryBatchResult(List<NotionCachedEvent> events, String diagnosticNote) {
+            this.events = events;
+            this.diagnosticNote = diagnosticNote;
+        }
+    }
+
+    private static QueryBatchResult queryEventsForSources(
+            Context context, String token, String ownerUserId, List<NotionSource> sources) {
         List<NotionCachedEvent> allEvents = new ArrayList<>();
+        String lastWarning = "";
         ZoneId zone = ZoneId.systemDefault();
-        String windowStart = LocalDate.now(zone).minusDays(40).toString();
-        String windowEnd = LocalDate.now(zone).plusDays(65).toString();
+        LocalDate minDay = LocalDate.now(zone).minusDays(45);
+        LocalDate maxDay = LocalDate.now(zone).plusDays(75);
+        String windowStart = minDay.toString();
+        String windowEnd = maxDay.toString();
 
         for (NotionSource src : sources) {
-            if (hiddenCalendars.contains(src.sourceKey)) continue;
+            if (CalendarWidgetProvider.isHiddenInAllProfiles(context, src.sourceKey)) {
+                continue;
+            }
             try {
-                List<JSONObject> pages = querySingleSourcePages(token, src, windowStart, windowEnd);
+                SingleQueryOutcome outcome = querySingleSourcePages(
+                        token, ownerUserId, src, windowStart, windowEnd);
+                if (!outcome.errorHint.isEmpty() && lastWarning.isEmpty()) {
+                    lastWarning = outcome.errorHint;
+                }
                 Set<String> seenPages = new HashSet<>();
-                for (JSONObject page : pages) {
-                    if (page.optBoolean("in_trash", false) || page.optBoolean("is_archived", false)) {
+                for (JSONObject page : outcome.pages) {
+                    if (page.optBoolean("in_trash", false)
+                            || page.optBoolean("is_archived", false)
+                            || page.optBoolean("archived", false)) {
                         continue;
                     }
-                    String pageId = page.optString("id", "");
+                    String pageId = optCleanString(page, "id");
                     if (pageId.isEmpty() || !seenPages.add(pageId)) continue;
 
                     NotionCachedEvent parsed = parsePageToEvent(page, src, zone);
-                    if (parsed != null) {
-                        allEvents.add(parsed);
+                    if (parsed == null) continue;
+                    // Client-side window guard (especially for Tier 3/4 unfiltered fallback)
+                    if (parsed.endEpochDay < minDay.toEpochDay() || parsed.startEpochDay > maxDay.toEpochDay()) {
+                        continue;
                     }
+                    allEvents.add(parsed);
                 }
-            } catch (Exception ignored) {
+            } catch (Exception e) {
+                if (lastWarning.isEmpty() && e.getMessage() != null) {
+                    lastWarning = e.getMessage();
+                }
             }
         }
-        return allEvents;
+        return new QueryBatchResult(allEvents, lastWarning);
     }
 
-    private static List<JSONObject> querySingleSourcePages(
-            String token, NotionSource src, String windowStart, String windowEnd) throws Exception {
-        JSONObject dateWindowFilter = buildDateWindowFilter(src, windowStart, windowEnd);
-        JSONObject combinedFilter = dateWindowFilter;
-        boolean hasViewFilter = !TextUtils.isEmpty(src.filterJson);
-        if (hasViewFilter) {
-            try {
-                JSONObject vf = new JSONObject(src.filterJson);
-                JSONArray andArr = new JSONArray();
-                andArr.put(vf);
-                andArr.put(dateWindowFilter);
-                combinedFilter = new JSONObject().put("and", andArr);
-            } catch (Exception ignored) {
-                hasViewFilter = false;
+    private static final class SingleQueryOutcome {
+        final List<JSONObject> pages;
+        final String errorHint;
+
+        SingleQueryOutcome(List<JSONObject> pages, String errorHint) {
+            this.pages = pages;
+            this.errorHint = errorHint;
+        }
+    }
+
+    private static SingleQueryOutcome querySingleSourcePages(
+            String token, String ownerUserId, NotionSource src, String windowStart, String windowEnd)
+            throws Exception {
+
+        boolean canServerFilterDate = "date".equals(src.datePropType)
+                || "formula".equals(src.datePropType)
+                || "created_time".equals(src.datePropType)
+                || "last_edited_time".equals(src.datePropType);
+
+        JSONArray dateBounds = canServerFilterDate ? buildDateBoundArray(src, windowStart, windowEnd) : null;
+
+        // Tier 1: Sanitized View Filter + Date Window Filter (flat <= 2-level compound filter)
+        if (!TextUtils.isEmpty(src.filterJson)) {
+            JSONObject sanitizedVf = sanitizeViewFilter(new JSONObject(src.filterJson), ownerUserId);
+            if (sanitizedVf != null && sanitizedVf.length() > 0) {
+                JSONObject tier1Filter = mergeFiltersFlat(sanitizedVf, dateBounds);
+                QueryAttempt t1 = executeDataSourceQuery(token, src.dataSourceId, tier1Filter, BETA_STATUS_GROUP);
+                if (t1.ok) {
+                    return new SingleQueryOutcome(t1.pages, "");
+                }
+                if (t1.httpCode == 403) {
+                    return new SingleQueryOutcome(Collections.emptyList(),
+                            "權限不足 (HTTP 403)：請確認 Notion Integration 已勾選「Read content（讀取內容）」！");
+                }
             }
         }
 
-        List<JSONObject> out = executeDataSourceQuery(token, src.dataSourceId, combinedFilter);
-        if (out == null && hasViewFilter) {
-            // Fallback without view filter if beta/special filter operator returned HTTP 400
-            out = executeDataSourceQuery(token, src.dataSourceId, dateWindowFilter);
+        // Tier 2: Date Window Filter only
+        if (dateBounds != null) {
+            JSONObject tier2Filter = new JSONObject().put("and", dateBounds);
+            QueryAttempt t2 = executeDataSourceQuery(token, src.dataSourceId, tier2Filter, null);
+            if (t2.ok) {
+                return new SingleQueryOutcome(t2.pages, "");
+            }
+            if (t2.httpCode == 403) {
+                return new SingleQueryOutcome(Collections.emptyList(),
+                        "權限不足 (HTTP 403)：請確認 Notion Integration 已勾選「Read content（讀取內容）」！");
+            }
         }
-        return out != null ? out : Collections.emptyList();
+
+        // Tier 3: Unfiltered /data_sources/{id}/query sorted by last_edited_time descending
+        QueryAttempt t3 = executeDataSourceQuery(token, src.dataSourceId, null, null);
+        if (t3.ok) {
+            return new SingleQueryOutcome(t3.pages, "");
+        }
+
+        // Tier 4: Legacy 2022-06-28 /databases/{databaseId}/query fallback
+        if (!TextUtils.isEmpty(src.databaseId)) {
+            QueryAttempt t4 = executeLegacyDatabaseQuery(token, src.databaseId);
+            if (t4.ok) {
+                return new SingleQueryOutcome(t4.pages, "");
+            }
+            return new SingleQueryOutcome(Collections.emptyList(),
+                    "查詢「" + src.shortLabel + "」失敗 (HTTP " + t4.httpCode + ")：" + t4.errMsg);
+        }
+
+        return new SingleQueryOutcome(Collections.emptyList(),
+                "查詢「" + src.shortLabel + "」失敗 (HTTP " + t3.httpCode + ")：" + t3.errMsg);
     }
 
-    private static JSONObject buildDateWindowFilter(NotionSource src, String windowStart, String windowEnd)
+    private static JSONArray buildDateBoundArray(NotionSource src, String windowStart, String windowEnd)
             throws Exception {
         JSONArray andArr = new JSONArray();
         if ("created_time".equals(src.datePropType) || "last_edited_time".equals(src.datePropType)) {
-            JSONObject f1 = new JSONObject();
-            f1.put("timestamp", src.datePropType);
-            f1.put(src.datePropType, new JSONObject().put("on_or_after", windowStart));
-            JSONObject f2 = new JSONObject();
-            f2.put("timestamp", src.datePropType);
-            f2.put(src.datePropType, new JSONObject().put("on_or_before", windowEnd));
-            andArr.put(f1);
-            andArr.put(f2);
+            andArr.put(new JSONObject()
+                    .put("timestamp", src.datePropType)
+                    .put(src.datePropType, new JSONObject().put("on_or_after", windowStart)));
+            andArr.put(new JSONObject()
+                    .put("timestamp", src.datePropType)
+                    .put(src.datePropType, new JSONObject().put("on_or_before", windowEnd)));
+        } else if ("formula".equals(src.datePropType)) {
+            andArr.put(new JSONObject()
+                    .put("property", src.datePropName)
+                    .put("formula", new JSONObject().put("date", new JSONObject().put("on_or_after", windowStart))));
+            andArr.put(new JSONObject()
+                    .put("property", src.datePropName)
+                    .put("formula", new JSONObject().put("date", new JSONObject().put("on_or_before", windowEnd))));
         } else {
-            JSONObject f1 = new JSONObject();
-            f1.put("property", src.datePropName);
-            f1.put("date", new JSONObject().put("on_or_after", windowStart));
-            JSONObject f2 = new JSONObject();
-            f2.put("property", src.datePropName);
-            f2.put("date", new JSONObject().put("on_or_before", windowEnd));
-            andArr.put(f1);
-            andArr.put(f2);
+            andArr.put(new JSONObject()
+                    .put("property", src.datePropName)
+                    .put("date", new JSONObject().put("on_or_after", windowStart)));
+            andArr.put(new JSONObject()
+                    .put("property", src.datePropName)
+                    .put("date", new JSONObject().put("on_or_before", windowEnd)));
         }
-        return new JSONObject().put("and", andArr);
+        return andArr;
     }
 
-    private static List<JSONObject> executeDataSourceQuery(
-            String token, String dataSourceId, JSONObject filter) throws Exception {
+    private static JSONObject mergeFiltersFlat(JSONObject sanitizedVf, JSONArray dateBounds) throws Exception {
+        if (dateBounds == null || dateBounds.length() == 0) return sanitizedVf;
+        JSONArray combined = new JSONArray();
+        if (sanitizedVf.has("and") && sanitizedVf.length() == 1) {
+            JSONArray vfAnd = sanitizedVf.optJSONArray("and");
+            if (vfAnd != null) {
+                for (int i = 0; i < vfAnd.length(); i++) {
+                    combined.put(vfAnd.get(i));
+                }
+            }
+        } else {
+            combined.put(sanitizedVf);
+        }
+        for (int i = 0; i < dateBounds.length(); i++) {
+            combined.put(dateBounds.get(i));
+        }
+        return new JSONObject().put("and", combined);
+    }
+
+    /**
+     * Cleans Notion View filters for Internal Integrations:
+     * - Replaces "me" in people filters with ownerUserId (or drops "contains: me" if unknown,
+     *   because Notion returns 0 results for "me" on Internal Integrations).
+     * - Strips empty {} filter nodes.
+     */
+    private static JSONObject sanitizeViewFilter(JSONObject filter, String ownerUserId) {
+        if (filter == null || filter.length() == 0) return null;
+        try {
+            if (filter.has("and")) {
+                JSONArray arr = filter.optJSONArray("and");
+                if (arr == null) return null;
+                JSONArray clean = new JSONArray();
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONObject sub = sanitizeViewFilter(arr.optJSONObject(i), ownerUserId);
+                    if (sub != null && sub.length() > 0) clean.put(sub);
+                }
+                if (clean.length() == 0) return null;
+                if (clean.length() == 1) return clean.getJSONObject(0);
+                return new JSONObject().put("and", clean);
+            }
+            if (filter.has("or")) {
+                JSONArray arr = filter.optJSONArray("or");
+                if (arr == null) return null;
+                JSONArray clean = new JSONArray();
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONObject sub = sanitizeViewFilter(arr.optJSONObject(i), ownerUserId);
+                    if (sub != null && sub.length() > 0) clean.put(sub);
+                }
+                if (clean.length() == 0) return null;
+                if (clean.length() == 1) return clean.getJSONObject(0);
+                return new JSONObject().put("or", clean);
+            }
+            if (filter.has("people")) {
+                JSONObject ppl = filter.optJSONObject("people");
+                if (ppl != null) {
+                    if ("me".equals(ppl.optString("contains"))) {
+                        if (TextUtils.isEmpty(ownerUserId)) return null;
+                        JSONObject copy = new JSONObject(filter.toString());
+                        copy.getJSONObject("people").put("contains", ownerUserId);
+                        return copy;
+                    }
+                    if ("me".equals(ppl.optString("does_not_contain"))) {
+                        if (TextUtils.isEmpty(ownerUserId)) return null;
+                        JSONObject copy = new JSONObject(filter.toString());
+                        copy.getJSONObject("people").put("does_not_contain", ownerUserId);
+                        return copy;
+                    }
+                }
+            }
+            return filter;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static final class QueryAttempt {
+        final boolean ok;
+        final int httpCode;
+        final String errMsg;
+        final List<JSONObject> pages;
+
+        QueryAttempt(boolean ok, int httpCode, String errMsg, List<JSONObject> pages) {
+            this.ok = ok;
+            this.httpCode = httpCode;
+            this.errMsg = errMsg;
+            this.pages = pages;
+        }
+    }
+
+    private static QueryAttempt executeDataSourceQuery(
+            String token, String dataSourceId, JSONObject filter, String betaHeader) throws Exception {
         List<JSONObject> pages = new ArrayList<>();
         String cursor = null;
         for (int pageNum = 0; pageNum < 3; pageNum++) {
             JSONObject body = new JSONObject();
-            if (filter != null) body.put("filter", filter);
+            if (filter != null) {
+                body.put("filter", filter);
+            } else {
+                JSONArray sorts = new JSONArray();
+                sorts.put(new JSONObject()
+                        .put("timestamp", "last_edited_time")
+                        .put("direction", "descending"));
+                body.put("sorts", sorts);
+            }
             body.put("page_size", 100);
-            body.put("result_type", "page");
             if (!TextUtils.isEmpty(cursor)) body.put("start_cursor", cursor);
 
-            HttpResult res = requestNotion(token, "POST", "/data_sources/" + dataSourceId + "/query", body.toString());
-            if (res.code == 400) {
-                return null; // Caller may retry with simpler filter
+            // IMPORTANT: Do NOT pass "result_type": "page" here — Notion rejects result_type
+            // on regular (non-wiki) data sources with HTTP 400!
+            HttpResult res = requestNotion(
+                    token, "POST", "/data_sources/" + dataSourceId + "/query", body.toString(), betaHeader);
+            if (res.code != 200) {
+                return new QueryAttempt(false, res.code, res.errorMsg, pages);
             }
-            if (res.code != 200) break;
 
             JSONObject json = new JSONObject(res.body);
             JSONArray results = json.optJSONArray("results");
@@ -1135,43 +1595,47 @@ public final class NotionManager {
                 }
             }
             if (!json.optBoolean("has_more", false)) break;
-            cursor = json.optString("next_cursor", "");
-            if (TextUtils.isEmpty(cursor) || "null".equals(cursor)) break;
+            cursor = optCleanString(json, "next_cursor");
+            if (cursor.isEmpty()) break;
         }
-        return pages;
+        return new QueryAttempt(true, 200, "", pages);
+    }
+
+    private static QueryAttempt executeLegacyDatabaseQuery(String token, String databaseId) throws Exception {
+        List<JSONObject> pages = new ArrayList<>();
+        JSONObject body = new JSONObject().put("page_size", 100);
+        HttpResult res = executeNotionHttp(
+                token, "POST", "/databases/" + databaseId + "/query", body.toString(), NOTION_VERSION_LEGACY, null);
+        if (res.code != 200) {
+            return new QueryAttempt(false, res.code, res.errorMsg, pages);
+        }
+        JSONArray results = new JSONObject(res.body).optJSONArray("results");
+        if (results != null) {
+            for (int i = 0; i < results.length(); i++) {
+                JSONObject item = results.optJSONObject(i);
+                if (item != null) pages.add(item);
+            }
+        }
+        return new QueryAttempt(true, 200, "", pages);
     }
 
     private static NotionCachedEvent parsePageToEvent(JSONObject page, NotionSource src, ZoneId zone) {
         JSONObject props = page.optJSONObject("properties");
         if (props == null) return null;
 
-        String startStr = null;
-        String endStr = null;
+        String[] startEnd = extractDateStartEndFromPage(page, props, src.datePropName, src.datePropId, src.datePropType);
+        String startStr = startEnd[0];
+        String endStr = startEnd[1];
 
-        if ("created_time".equals(src.datePropType)) {
-            startStr = page.optString("created_time", "");
-        } else if ("last_edited_time".equals(src.datePropType)) {
-            startStr = page.optString("last_edited_time", "");
-        } else {
-            JSONObject dateProp = findPropertyObject(props, src.datePropName, src.datePropId);
-            if (dateProp != null) {
-                JSONObject dateVal = dateProp.optJSONObject("date");
-                if (dateVal != null) {
-                    startStr = optCleanString(dateVal, "start");
-                    endStr = optCleanString(dateVal, "end");
-                }
-            }
-            if (TextUtils.isEmpty(endStr) && !TextUtils.isEmpty(src.endDatePropName)) {
-                JSONObject endProp = props.optJSONObject(src.endDatePropName);
-                if (endProp != null && endProp.optJSONObject("date") != null) {
-                    endStr = optCleanString(endProp.optJSONObject("date"), "start");
-                }
+        if (TextUtils.isEmpty(endStr) && !TextUtils.isEmpty(src.endDatePropName)) {
+            String[] extraEnd = extractDateStartEndFromPage(page, props, src.endDatePropName, "", "date");
+            if (!TextUtils.isEmpty(extraEnd[0])) {
+                endStr = extraEnd[0];
             }
         }
 
         if (TextUtils.isEmpty(startStr)) return null;
 
-        // Extract page title, optional emoji, and optional status badge
         String pageEmoji = extractEmoji(page.optJSONObject("icon"));
         String titleText = "";
         String statusText = "";
@@ -1194,7 +1658,6 @@ public final class NotionManager {
         }
 
         String url = optCleanString(page, "url");
-
         boolean isAllDay = !startStr.contains("T") && startStr.length() >= 10;
         try {
             if (isAllDay) {
@@ -1225,14 +1688,93 @@ public final class NotionManager {
                     endMillis = beginMillis + 3_600_000L;
                 }
                 LocalDate startDay = Instant.ofEpochMilli(beginMillis).atZone(zone).toLocalDate();
+                LocalDate endDay = Instant.ofEpochMilli(endMillis).atZone(zone).toLocalDate();
                 return new NotionCachedEvent(
                         src.sourceKey, page.optString("id"), titleText, statusText, url,
-                        false, startDay.toEpochDay(), startDay.toEpochDay(),
+                        false, startDay.toEpochDay(), Math.max(startDay.toEpochDay(), endDay.toEpochDay()),
                         beginMillis, endMillis, hasExplicitEnd);
             }
         } catch (Exception e) {
             return null;
         }
+    }
+
+    private static String[] extractDateStartEndFromPage(
+            JSONObject page, JSONObject props, String propName, String propId, String propType) {
+        if ("created_time".equals(propType)) {
+            return new String[]{optCleanString(page, "created_time"), ""};
+        }
+        if ("last_edited_time".equals(propType)) {
+            return new String[]{optCleanString(page, "last_edited_time"), ""};
+        }
+        JSONObject prop = findPropertyObject(props, propName, propId);
+        if (prop == null) return new String[]{"", ""};
+
+        String actualType = prop.optString("type", propType);
+        JSONObject dateObj = null;
+        if ("date".equals(actualType)) {
+            dateObj = prop.optJSONObject("date");
+        } else if ("formula".equals(actualType)) {
+            JSONObject f = prop.optJSONObject("formula");
+            if (f != null && "date".equals(f.optString("type"))) {
+                dateObj = f.optJSONObject("date");
+            }
+        } else if ("rollup".equals(actualType)) {
+            JSONObject r = prop.optJSONObject("rollup");
+            if (r != null && "date".equals(r.optString("type"))) {
+                dateObj = r.optJSONObject("date");
+            }
+        } else if ("created_time".equals(actualType)) {
+            return new String[]{optCleanString(prop, "created_time"), ""};
+        } else if ("last_edited_time".equals(actualType)) {
+            return new String[]{optCleanString(prop, "last_edited_time"), ""};
+        }
+
+        if (dateObj == null) return new String[]{"", ""};
+        return new String[]{optCleanString(dateObj, "start"), optCleanString(dateObj, "end")};
+    }
+
+    private static String discoverFirstPersonUserId(String token) {
+        try {
+            HttpResult uRes = requestNotion(token, "GET", "/users?page_size=50", null, null);
+            if (uRes.code == 200) {
+                JSONArray arr = new JSONObject(uRes.body).optJSONArray("results");
+                if (arr != null) {
+                    for (int i = 0; i < arr.length(); i++) {
+                        JSONObject u = arr.optJSONObject(i);
+                        if (u != null && "person".equals(u.optString("type"))) {
+                            return optCleanString(u, "id");
+                        }
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return "";
+    }
+
+    private static String extractNotionUuid(String rawInput) {
+        if (rawInput == null) return "";
+        String trimmed = rawInput.trim();
+        // Strip query string (?v=...) first so we grab the database ID rather than the view ID!
+        int qIdx = trimmed.indexOf('?');
+        String mainPart = qIdx >= 0 ? trimmed.substring(0, qIdx) : trimmed;
+        Matcher m = HEX32_PATTERN.matcher(mainPart);
+        String lastMatch = "";
+        while (m.find()) {
+            lastMatch = m.group(1);
+        }
+        if (!lastMatch.isEmpty()) return formatUuid(lastMatch);
+        Matcher m2 = HEX32_PATTERN.matcher(trimmed);
+        if (m2.find()) return formatUuid(m2.group(1));
+        return "";
+    }
+
+    private static String formatUuid(String raw) {
+        String hex = raw.replace("-", "").toLowerCase();
+        if (hex.length() != 32) return raw;
+        return hex.substring(0, 8) + "-" + hex.substring(8, 12) + "-"
+                + hex.substring(12, 16) + "-" + hex.substring(16, 20) + "-" + hex.substring(20);
     }
 
     private static long parseIsoToMillis(String iso, ZoneId fallbackZone) {
@@ -1258,7 +1800,7 @@ public final class NotionManager {
             JSONObject p = props.optJSONObject(k);
             if (p == null) continue;
             String id = p.optString("id", "");
-            if (id.equals(propId) || decodePropId(id).equals(decodedTarget)) {
+            if (!propId.isEmpty() && (id.equals(propId) || decodePropId(id).equals(decodedTarget))) {
                 return p;
             }
         }
@@ -1269,6 +1811,7 @@ public final class NotionManager {
             String propId,
             Map<String, DatePropOption> lookup,
             List<DatePropOption> primaryDateProps,
+            List<DatePropOption> formulaOrRollupProps,
             List<DatePropOption> allDateCapableProps) {
         if (!TextUtils.isEmpty(propId)) {
             DatePropOption found = lookup.get(propId);
@@ -1277,6 +1820,7 @@ public final class NotionManager {
             if (found != null) return found;
         }
         if (!primaryDateProps.isEmpty()) return primaryDateProps.get(0);
+        if (!formulaOrRollupProps.isEmpty()) return formulaOrRollupProps.get(0);
         if (!allDateCapableProps.isEmpty()) return allDateCapableProps.get(0);
         return null;
     }
@@ -1360,16 +1904,17 @@ public final class NotionManager {
         }
     }
 
-    private static HttpResult requestNotion(String token, String method, String path, String jsonBody) {
-        HttpResult primary = executeNotionHttp(token, method, path, jsonBody, NOTION_VERSION_PRIMARY);
+    private static HttpResult requestNotion(
+            String token, String method, String path, String jsonBody, String betaHeader) {
+        HttpResult primary = executeNotionHttp(token, method, path, jsonBody, NOTION_VERSION_PRIMARY, betaHeader);
         if (primary.code == 400 && primary.errorMsg.contains("Notion-Version")) {
-            return executeNotionHttp(token, method, path, jsonBody, NOTION_VERSION_FALLBACK);
+            return executeNotionHttp(token, method, path, jsonBody, NOTION_VERSION_FALLBACK, betaHeader);
         }
         return primary;
     }
 
     private static HttpResult executeNotionHttp(
-            String token, String method, String path, String jsonBody, String version) {
+            String token, String method, String path, String jsonBody, String version, String betaHeader) {
         for (int attempt = 0; attempt < 3; attempt++) {
             HttpURLConnection conn = null;
             try {
@@ -1381,6 +1926,9 @@ public final class NotionManager {
                 conn.setRequestProperty("Authorization", "Bearer " + token);
                 conn.setRequestProperty("Notion-Version", version);
                 conn.setRequestProperty("Accept", "application/json");
+                if (!TextUtils.isEmpty(betaHeader)) {
+                    conn.setRequestProperty("Notion-Beta", betaHeader);
+                }
 
                 if (jsonBody != null) {
                     conn.setDoOutput(true);
