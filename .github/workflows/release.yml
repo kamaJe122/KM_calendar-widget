@@ -1,0 +1,62 @@
+name: Build & Release APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release Tag (例如 v2.1.0-b8)'
+        required: true
+        default: 'v2.0.0-b7'
+      release_title:
+        description: 'Release Title (例如 KM 桌面行事曆小工具 v2.1.0)'
+        required: true
+        default: 'KM 桌面行事曆小工具 v2.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'gradle'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build Signed Release APK
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleRelease --no-daemon
+          cp app/build/outputs/apk/release/app-release.apk KM_calendar-widget.apk
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KM_calendar-widget-apk
+          path: KM_calendar-widget.apk
+
+      - name: Publish GitHub Release (if not already published)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.inputs.tag_name || github.ref_name }}"
+          TITLE="${{ github.event.inputs.release_title || github.ref_name }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, skipping creation."
+          else
+            gh release create "$TAG" KM_calendar-widget.apk \
+              --title "$TITLE" \
+              --generate-notes
+          fi
