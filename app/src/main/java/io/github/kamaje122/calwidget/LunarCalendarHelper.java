@@ -69,8 +69,8 @@ public final class LunarCalendarHelper {
         long utcNoonMillis = date.atTime(12, 0).toInstant(ZoneOffset.UTC).toEpochMilli();
         cc.setTimeInMillis(utcNoonMillis);
 
-        int extYear = cc.get(ChineseCalendar.EXTENDED_YEAR);
-        int cycleIdx = Math.floorMod(extYear - 1, 60);
+        int cycleYear = cc.get(ChineseCalendar.YEAR); // 1..60 sexagenary cycle (e.g. 2026 -> 43 -> 丙午)
+        int cycleIdx = Math.floorMod(cycleYear - 1, 60);
         String ganZhi = STEMS[cycleIdx % 10] + BRANCHES[cycleIdx % 12] + "年";
 
         int monthIdx = Math.max(0, Math.min(11, cc.get(ChineseCalendar.MONTH)));

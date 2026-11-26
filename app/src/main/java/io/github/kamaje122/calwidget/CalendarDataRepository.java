@@ -72,7 +72,9 @@ public final class CalendarDataRepository {
         public final boolean recurring;
 
         public String rrule = "";
+        public String rdate = "";
         public long originalId = -1L;
+        public String originalSyncId = "";
         public long originalInstanceTime = 0L;
         public boolean originalAllDay;
         public long dtStart;
@@ -98,7 +100,7 @@ public final class CalendarDataRepository {
         }
 
         public boolean isException() {
-            return originalId > 0L;
+            return originalId > 0L || !TextUtils.isEmpty(originalSyncId);
         }
 
         /** Human readable recurrence summary such as 「每週」. */
@@ -117,6 +119,8 @@ public final class CalendarDataRepository {
             return base;
         }
     }
+
+    private static volatile boolean sRecurringInstancesHealed = false;
 
     private CalendarDataRepository() {
     }
@@ -188,6 +192,7 @@ public final class CalendarDataRepository {
                 CalendarContract.Events.RRULE,
                 CalendarContract.Events.RDATE,
                 CalendarContract.Events.ORIGINAL_ID,
+                CalendarContract.Events.ORIGINAL_SYNC_ID,
                 CalendarContract.Events.ORIGINAL_INSTANCE_TIME,
                 CalendarContract.Events.ORIGINAL_ALL_DAY,
                 CalendarContract.Events.DTSTART,
@@ -215,24 +220,163 @@ public final class CalendarDataRepository {
                     } catch (NumberFormatException ignored) {
                     }
                 }
-                boolean recurring = !rrule.isEmpty() || !rdate.isEmpty() || origId > 0L;
+                String origSyncId = nonNull(c.getString(7));
+                if (origId <= 0L && !origSyncId.isEmpty() && calId > 0L) {
+                    origId = findMasterIdBySyncId(context, calId, origSyncId);
+                }
+                boolean recurring = !rrule.isEmpty() || !rdate.isEmpty() || origId > 0L || !origSyncId.isEmpty();
                 SystemEventMeta m = new SystemEventMeta(eventId, calId, accName, accType, writable, recurring);
                 m.rrule = rrule;
+                m.rdate = rdate;
                 m.originalId = origId;
-                m.originalInstanceTime = c.isNull(7) ? 0L : c.getLong(7);
-                m.originalAllDay = !c.isNull(8) && c.getInt(8) != 0;
-                m.dtStart = c.getLong(9);
-                m.allDay = c.getInt(10) != 0;
-                m.timezone = nonNull(c.getString(11));
-                m.availability = c.isNull(12) ? -1 : c.getInt(12);
-                m.accessLevel = c.isNull(13) ? -1 : c.getInt(13);
-                m.calendarName = nonNull(c.getString(14));
-                m.calendarColor = AppTheme.normalizePillColor(c.getInt(15));
+                m.originalSyncId = origSyncId;
+                m.originalInstanceTime = c.isNull(8) ? 0L : c.getLong(8);
+                m.originalAllDay = !c.isNull(9) && c.getInt(9) != 0;
+                m.dtStart = c.getLong(10);
+                m.allDay = c.getInt(11) != 0;
+                m.timezone = nonNull(c.getString(12));
+                m.availability = c.isNull(13) ? -1 : c.getInt(13);
+                m.accessLevel = c.isNull(14) ? -1 : c.getInt(14);
+                m.calendarName = nonNull(c.getString(15));
+                m.calendarColor = AppTheme.normalizePillColor(c.getInt(16));
                 return m;
             }
         } catch (RuntimeException ignored) {
         }
         return null;
+    }
+
+    private static long findMasterIdBySyncId(Context context, long calId, String syncId) {
+        try (Cursor c = context.getContentResolver().query(
+                CalendarContract.Events.CONTENT_URI,
+                new String[]{CalendarContract.Events._ID},
+                CalendarContract.Events.CALENDAR_ID + " = ? AND " + CalendarContract.Events._SYNC_ID + " = ?",
+                new String[]{String.valueOf(calId), syncId}, null)) {
+            if (c != null && c.moveToFirst()) {
+                return c.getLong(0);
+            }
+        } catch (RuntimeException ignored) {
+        }
+        return -1L;
+    }
+
+    /**
+     * Self-heals active recurring events in CalendarContract.Events whose Instances rows were
+     * dropped when CalendarProvider2 received a DTSTART update without RRULE in modValues
+     * (which leaves at most a single row at DTSTART and zero expanded future occurrences).
+     */
+    public static void healUnexpandedRecurringEvents(Context context) {
+        if (sRecurringInstancesHealed || !hasReadPermission(context) || !hasWritePermission(context)) {
+            return;
+        }
+        sRecurringInstancesHealed = true;
+        try {
+            long nowMs = System.currentTimeMillis();
+            long winStart = nowMs - 7L * 86_400_000L;
+            long winEnd = nowMs + 400L * 86_400_000L;
+
+            String sel = CalendarContract.Events.VISIBLE + " = 1 AND "
+                    + CalendarContract.Events.DELETED + " = 0 AND "
+                    + CalendarContract.Events.RRULE + " IS NOT NULL AND "
+                    + CalendarContract.Events.RRULE + " != '' AND "
+                    + CalendarContract.Calendars.CALENDAR_ACCESS_LEVEL + " >= "
+                    + CalendarContract.Calendars.CAL_ACCESS_CONTRIBUTOR;
+            String[] proj = new String[]{
+                    CalendarContract.Events._ID,
+                    CalendarContract.Events.DTSTART,
+                    CalendarContract.Events.LAST_DATE,
+                    CalendarContract.Events.RRULE,
+                    CalendarContract.Events.RDATE,
+                    CalendarContract.Events.STATUS
+            };
+
+            Map<Long, Long> candidateDtStart = new HashMap<>();
+            Map<Long, String[]> candidateRules = new HashMap<>();
+            ContentResolver cr = context.getContentResolver();
+            try (Cursor ec = cr.query(CalendarContract.Events.CONTENT_URI, proj, sel, null, null)) {
+                if (ec != null) {
+                    while (ec.moveToNext()) {
+                        if (!ec.isNull(5) && ec.getInt(5) == CalendarContract.Events.STATUS_CANCELED) {
+                            continue;
+                        }
+                        long id = ec.getLong(0);
+                        long dtStart = ec.getLong(1);
+                        boolean hasLast = !ec.isNull(2);
+                        long lastDate = hasLast ? ec.getLong(2) : -1L;
+                        String rrule = nonNull(ec.getString(3));
+                        String rdate = nonNull(ec.getString(4));
+                        if (dtStart > nowMs + 30L * 86_400_000L) continue;
+                        if (hasLast && lastDate > 0L) {
+                            if (lastDate < nowMs - 7L * 86_400_000L) continue;
+                            if (lastDate <= dtStart + 86_400_000L) continue;
+                        }
+                        String upper = rrule.toUpperCase(Locale.ROOT);
+                        if (upper.contains("FREQ=YEARLY") && upper.contains("INTERVAL=")
+                                && !upper.contains("INTERVAL=1;") && !upper.endsWith("INTERVAL=1")) {
+                            continue;
+                        }
+                        candidateDtStart.put(id, dtStart);
+                        candidateRules.put(id, new String[]{rrule, rdate});
+                    }
+                }
+            }
+            if (candidateDtStart.isEmpty()) return;
+
+            Set<Long> healthySeriesIds = new HashSet<>();
+            Uri.Builder ib = CalendarContract.Instances.CONTENT_URI.buildUpon();
+            ContentUris.appendId(ib, winStart);
+            ContentUris.appendId(ib, winEnd);
+            try (Cursor ic = cr.query(ib.build(),
+                    new String[]{
+                            CalendarContract.Instances.EVENT_ID,
+                            CalendarContract.Instances.BEGIN,
+                            CalendarContract.Events.ORIGINAL_ID
+                    },
+                    null, null, null)) {
+                if (ic != null) {
+                    while (ic.moveToNext()) {
+                        long evId = ic.getLong(0);
+                        long begin = ic.getLong(1);
+                        Long masterDt = candidateDtStart.get(evId);
+                        if (masterDt != null && begin > masterDt + 3_600_000L) {
+                            healthySeriesIds.add(evId);
+                        }
+                        if (!ic.isNull(2)) {
+                            try {
+                                long origId = Long.parseLong(ic.getString(2));
+                                Long origDt = candidateDtStart.get(origId);
+                                if (origDt != null && begin > origDt + 3_600_000L) {
+                                    healthySeriesIds.add(origId);
+                                }
+                            } catch (NumberFormatException ignored) {
+                            }
+                        }
+                    }
+                }
+            }
+
+            boolean anyRepaired = false;
+            for (Map.Entry<Long, Long> e : candidateDtStart.entrySet()) {
+                long id = e.getKey();
+                if (!healthySeriesIds.contains(id)) {
+                    String[] rules = candidateRules.get(id);
+                    ContentValues fix = new ContentValues();
+                    fix.put(CalendarContract.Events.DTSTART, e.getValue());
+                    fix.put(CalendarContract.Events.RRULE, rules[0]);
+                    if (!rules[1].isEmpty()) {
+                        fix.put(CalendarContract.Events.RDATE, rules[1]);
+                    }
+                    Uri u = ContentUris.withAppendedId(CalendarContract.Events.CONTENT_URI, id);
+                    if (cr.update(u, fix, null, null) > 0) {
+                        anyRepaired = true;
+                    }
+                }
+            }
+            if (anyRepaired) {
+                CalendarWidgetProvider.updateAll(context);
+            }
+        } catch (RuntimeException ignored) {
+        }
     }
 
     /**
@@ -250,6 +394,7 @@ public final class CalendarDataRepository {
         long maxEpochDay = endDate.toEpochDay();
 
         if (hasReadPermission(context)) {
+            healUnexpandedRecurringEvents(context);
             long queryStartMs = startDate.minusDays(1).atStartOfDay(zone).toInstant().toEpochMilli();
             long queryEndMs = endDate.plusDays(2).atStartOfDay(zone).toInstant().toEpochMilli();
 
@@ -471,7 +616,7 @@ public final class CalendarDataRepository {
             } else if (meta.isException() && scope != EDIT_SCOPE_SINGLE) {
                 series = inspectSystemEvent(context, meta.originalId);
                 if (series == null) {
-                    return plainUpdate(context, meta.eventId, -1L, title, location, description,
+                    return plainUpdate(context, meta, -1L, title, location, description,
                             allDay, startDate, endDate, beginMillis, endMillis) ? meta.eventId : -1L;
                 }
                 origInstance = meta.originalInstanceTime > 0 ? meta.originalInstanceTime : instanceBeginMillis;
@@ -479,7 +624,7 @@ public final class CalendarDataRepository {
             } else {
                 // Plain single event, or an already-detached exception edited "only this one"
                 long calTarget = meta.isException() ? -1L : targetCalendarId;
-                boolean ok = plainUpdate(context, meta.eventId, calTarget, title, location, description,
+                boolean ok = plainUpdate(context, meta, calTarget, title, location, description,
                         allDay, startDate, endDate, beginMillis, endMillis);
                 if (ok) finishMutation(context, calTarget > 0 ? calTarget : syncCal);
                 return ok ? meta.eventId : -1L;
@@ -510,7 +655,7 @@ public final class CalendarDataRepository {
                 boolean ok = updateWholeSeries(context, series, origInstance, origAllDay,
                         title, location, description, allDay, startDate, endDate, beginMillis, endMillis);
                 if (ok && meta.isException()) {
-                    plainUpdate(context, meta.eventId, -1L, title, location, description,
+                    plainUpdate(context, meta, -1L, title, location, description,
                             allDay, startDate, endDate, beginMillis, endMillis);
                 }
                 resultId = ok ? series.eventId : -1L;
@@ -548,11 +693,11 @@ public final class CalendarDataRepository {
     }
 
     private static boolean plainUpdate(
-            Context context, long eventId, long targetCalendarId,
+            Context context, SystemEventMeta meta, long targetCalendarId,
             String title, String location, String description,
             boolean allDay, LocalDate startDate, LocalDate endDate, long beginMillis, long endMillis) {
         ContentValues cv = new ContentValues();
-        if (targetCalendarId > 0) {
+        if (targetCalendarId > 0 && !meta.isException()) {
             cv.put(CalendarContract.Events.CALENDAR_ID, targetCalendarId);
         }
         cv.put(CalendarContract.Events.TITLE, title);
@@ -560,7 +705,20 @@ public final class CalendarDataRepository {
         cv.put(CalendarContract.Events.DESCRIPTION, description == null ? "" : description);
         populateEventTimeValues(cv, allDay, startDate, endDate, beginMillis, endMillis);
         cv.putNull(CalendarContract.Events.DURATION);
-        Uri uri = ContentUris.withAppendedId(CalendarContract.Events.CONTENT_URI, eventId);
+        if (meta.isException()) {
+            // CalendarInstancesHelper.updateInstancesLocked inspects modValues directly to detect
+            // recurrence exceptions; preserve linkage keys so Instances re-expands properly.
+            if (meta.originalId > 0L) {
+                cv.put(CalendarContract.Events.ORIGINAL_ID, meta.originalId);
+            }
+            if (!TextUtils.isEmpty(meta.originalSyncId)) {
+                cv.put(CalendarContract.Events.ORIGINAL_SYNC_ID, meta.originalSyncId);
+            }
+            if (meta.originalInstanceTime > 0L) {
+                cv.put(CalendarContract.Events.ORIGINAL_INSTANCE_TIME, meta.originalInstanceTime);
+            }
+        }
+        Uri uri = ContentUris.withAppendedId(CalendarContract.Events.CONTENT_URI, meta.eventId);
         return context.getContentResolver().update(uri, cv, null, null) > 0;
     }
 
@@ -579,12 +737,20 @@ public final class CalendarDataRepository {
         cv.put(CalendarContract.Events.EVENT_LOCATION, location == null ? "" : location);
         cv.put(CalendarContract.Events.DESCRIPTION, description == null ? "" : description);
         putSeriesTiming(cv, allDay, masterDate, startDate, endDate, beginMillis, endMillis, zone);
-        if (dayShift != 0) {
-            String adjusted = adjustSingleByDay(series.rrule, masterDate);
-            if (!adjusted.equals(series.rrule)) {
-                cv.put(CalendarContract.Events.RRULE, adjusted);
-            }
+
+        // CRITICAL: Android's CalendarInstancesHelper.updateInstancesLocked(modValues, ...) checks
+        // modValues (not the DB row!) for RRULE/RDATE right after deleting existing Instances when
+        // DTSTART is present. Always include RRULE/RDATE so Instances are immediately re-expanded!
+        String rruleToWrite = dayShift != 0
+                ? adjustSingleByDay(series.rrule, masterDate)
+                : series.rrule;
+        if (!TextUtils.isEmpty(rruleToWrite)) {
+            cv.put(CalendarContract.Events.RRULE, rruleToWrite);
         }
+        if (!TextUtils.isEmpty(series.rdate)) {
+            cv.put(CalendarContract.Events.RDATE, series.rdate);
+        }
+
         Uri uri = ContentUris.withAppendedId(CalendarContract.Events.CONTENT_URI, series.eventId);
         return context.getContentResolver().update(uri, cv, null, null) > 0;
     }
@@ -627,12 +793,17 @@ public final class CalendarDataRepository {
         long newId = parseId(cr.insert(CalendarContract.Events.CONTENT_URI, nv));
         if (newId < 0) return -1L;
 
-        // 2. Truncate the original series so it ends right before the tapped occurrence
+        // 2. Truncate the original series so it ends right before the tapped occurrence.
+        // Include DTSTART so CalendarInstancesHelper.updateInstancesLocked re-expands Instances!
         Map<String, String> oldParts = new java.util.LinkedHashMap<>(parts);
         oldParts.remove("COUNT");
         oldParts.put("UNTIL", formatUntil(origInstance, origAllDay || series.allDay, zone));
         ContentValues ov = new ContentValues();
+        ov.put(CalendarContract.Events.DTSTART, series.dtStart);
         ov.put(CalendarContract.Events.RRULE, joinRRule(oldParts));
+        if (!TextUtils.isEmpty(series.rdate)) {
+            ov.put(CalendarContract.Events.RDATE, series.rdate);
+        }
         Uri oldUri = ContentUris.withAppendedId(CalendarContract.Events.CONTENT_URI, series.eventId);
         if (cr.update(oldUri, ov, null, null) <= 0) {
             cr.delete(ContentUris.withAppendedId(CalendarContract.Events.CONTENT_URI, newId), null, null);
@@ -658,7 +829,7 @@ public final class CalendarDataRepository {
             cv.put(CalendarContract.Events.ALL_DAY, 0);
             cv.put(CalendarContract.Events.DTSTART, dtStart);
             cv.putNull(CalendarContract.Events.DTEND);
-            cv.put(CalendarContract.Events.DURATION, "PT" + durSec + "S");
+            cv.put(CalendarContract.Events.DURATION, "P" + durSec + "S");
             cv.put(CalendarContract.Events.EVENT_TIMEZONE, TimeZone.getDefault().getID());
         }
     }
@@ -784,6 +955,16 @@ public final class CalendarDataRepository {
             if (scope == EDIT_SCOPE_SINGLE) {
                 if (meta.isException()) {
                     ContentValues cv = new ContentValues();
+                    cv.put(CalendarContract.Events.DTSTART, meta.dtStart);
+                    if (meta.originalId > 0L) {
+                        cv.put(CalendarContract.Events.ORIGINAL_ID, meta.originalId);
+                    }
+                    if (!TextUtils.isEmpty(meta.originalSyncId)) {
+                        cv.put(CalendarContract.Events.ORIGINAL_SYNC_ID, meta.originalSyncId);
+                    }
+                    if (origInstance > 0L) {
+                        cv.put(CalendarContract.Events.ORIGINAL_INSTANCE_TIME, origInstance);
+                    }
                     cv.put(CalendarContract.Events.STATUS, CalendarContract.Events.STATUS_CANCELED);
                     ok = cr.update(ContentUris.withAppendedId(CalendarContract.Events.CONTENT_URI, meta.eventId),
                             cv, null, null) > 0;
@@ -803,7 +984,11 @@ public final class CalendarDataRepository {
                 parts.remove("COUNT");
                 parts.put("UNTIL", formatUntil(origInstance, origAllDay || series.allDay, ZoneId.systemDefault()));
                 ContentValues ov = new ContentValues();
+                ov.put(CalendarContract.Events.DTSTART, series.dtStart);
                 ov.put(CalendarContract.Events.RRULE, joinRRule(parts));
+                if (!TextUtils.isEmpty(series.rdate)) {
+                    ov.put(CalendarContract.Events.RDATE, series.rdate);
+                }
                 ok = cr.update(ContentUris.withAppendedId(CalendarContract.Events.CONTENT_URI, series.eventId),
                         ov, null, null) > 0;
                 if (ok && meta.isException()) {

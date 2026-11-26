@@ -642,11 +642,16 @@ public final class MultiDayTimelineView extends View {
             pillPaint.setColor(b.event.color);
             canvas.drawRoundRect(tmpRect, dp(6f), dp(6f), pillPaint);
 
-            boolean badge = showPencilBadges && (right - left) >= dp(56f) && (bottom - top) >= dp(24f);
+            // Keep title & pencil badge visible when the top of a multi-hour block is scrolled above the header
+            float contentTop = (top < scrollYOffset)
+                    ? Math.min(Math.max(top, bottom - dp(26f)), scrollYOffset + dp(2f))
+                    : top;
+
+            boolean badge = showPencilBadges && (right - left) >= dp(56f) && (bottom - contentTop) >= dp(22f);
             if (badge) {
                 float r = dp(10f);
                 float cx = right - dp(3f) - r;
-                float cy = top + dp(2.5f) + r;
+                float cy = contentTop + dp(2.5f) + r;
                 drawPencilBadge(canvas, cx, cy, r, 1f, b.event.color);
                 float half = dp(18f);
                 b.editHitRect.set(cx - half + dragX, cy - half + pinnedH - scrollYOffset,
@@ -654,7 +659,7 @@ public final class MultiDayTimelineView extends View {
             }
 
             int textW = (int) ((right - left) - dp(7f) - (badge ? dp(22f) : 0f));
-            int boxH = (int) ((bottom - top) - dp(5f));
+            int boxH = (int) ((bottom - contentTop) - dp(5f));
             if (textW > dp(8f) && boxH > dp(10f)) {
                 eventTitlePaint.setColor(AppTheme.textColorOnPill(b.event.color));
                 String body = b.event.title;
@@ -671,8 +676,8 @@ public final class MultiDayTimelineView extends View {
                     body = b.event.title + "\n" + b.event.statusLabel;
                 }
                 canvas.save();
-                canvas.clipRect(left + dp(3.5f), top + dp(2.5f), left + dp(3.5f) + textW, bottom - dp(2.5f));
-                canvas.translate(left + dp(3.5f), top + dp(2.5f));
+                canvas.clipRect(left + dp(3.5f), contentTop + dp(2.5f), left + dp(3.5f) + textW, bottom - dp(2.5f));
+                canvas.translate(left + dp(3.5f), contentTop + dp(2.5f));
                 StaticLayout sl = StaticLayout.Builder.obtain(body, 0, body.length(), eventTitlePaint, textW)
                         .setAlignment(Layout.Alignment.ALIGN_NORMAL)
                         .setIncludePad(false)

@@ -643,6 +643,7 @@ public class CalendarWidgetProvider extends AppWidgetProvider {
 
         if (context.checkSelfPermission(Manifest.permission.READ_CALENDAR)
                 == PackageManager.PERMISSION_GRANTED) {
+            CalendarDataRepository.healUnexpandedRecurringEvents(context);
             Uri.Builder builder = CalendarContract.Instances.CONTENT_URI.buildUpon();
             ContentUris.appendId(builder, dayStart - 86_400_000L);
             ContentUris.appendId(builder, dayEnd + 86_400_000L);
