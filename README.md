@@ -10,7 +10,7 @@
 ## 安裝與 App 內更新說明
 
 1. 前往 [**Releases**](https://github.com/kamaJe122/KM_calendar-widget/releases) 下載最新的 `KM_calendar-widget.apk`。
-2. **若先前安裝過舊版（v1.5 單機版）**：因 v2.0.0 起改用儲存庫專屬簽章（`km-calwidget-release.jks`），**第一次**升級請先移除手機上的舊版 v1.5 再安裝 v2.0.0。
+2. **若先前安裝過舊版（v1.5 單機版）**：因 v2.0.0 起改用專案專屬正式簽章（安全儲存於 GitHub Actions Secrets），**第一次**升級請先移除手機上的舊版 v1.5 再安裝 v2.0.0。
 3. **v2.0.0 之後的所有更新**：直接打開「KM 桌面行事曆小工具」App → 在最上方「**App 內版本更新（GitHub）**」卡片點 **「檢查更新」→「下載並安裝新版」** 即可直接覆蓋更新，所有設定與 Notion Token 都會完整保留！
 
 ---

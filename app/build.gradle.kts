@@ -1,9 +1,22 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
 }
 
-val releaseKeystoreFile = rootProject.file("km-calwidget-release.jks")
-val hasReleaseKeystore = releaseKeystoreFile.exists()
+val keystorePropsFile = rootProject.file("keystore.properties")
+val keystoreProps = Properties().apply {
+    if (keystorePropsFile.exists()) {
+        keystorePropsFile.inputStream().use { load(it) }
+    }
+}
+val releaseKeystoreFile = rootProject.file(
+    keystoreProps.getProperty("storeFile") ?: "km-calwidget-release.jks"
+)
+val storePass = System.getenv("CALWIDGET_STORE_PASS") ?: keystoreProps.getProperty("storePassword")
+val aliasName = System.getenv("CALWIDGET_KEY_ALIAS") ?: keystoreProps.getProperty("keyAlias") ?: "calwidget"
+val keyPass = System.getenv("CALWIDGET_KEY_PASS") ?: keystoreProps.getProperty("keyPassword")
+val hasReleaseKeystore = releaseKeystoreFile.exists() && !storePass.isNullOrBlank() && !keyPass.isNullOrBlank()
 
 android {
     namespace = "io.github.kamaje122.calwidget"
@@ -21,9 +34,9 @@ android {
         if (hasReleaseKeystore) {
             create("release") {
                 storeFile = releaseKeystoreFile
-                storePassword = System.getenv("CALWIDGET_STORE_PASS") ?: "calwidget2026"
-                keyAlias = System.getenv("CALWIDGET_KEY_ALIAS") ?: "calwidget"
-                keyPassword = System.getenv("CALWIDGET_KEY_PASS") ?: "calwidget2026"
+                storePassword = storePass
+                keyAlias = aliasName
+                keyPassword = keyPass
                 enableV1Signing = true
                 enableV2Signing = true
                 enableV3Signing = true
