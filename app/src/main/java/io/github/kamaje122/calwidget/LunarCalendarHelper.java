@@ -1,14 +1,18 @@
 package io.github.kamaje122.calwidget;
 
 import android.icu.util.ChineseCalendar;
+import android.icu.util.TimeZone;
 
 import java.time.LocalDate;
+import java.time.ZoneOffset;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Fast, zero-dependency Traditional Chinese Lunar Calendar helper backed by Android ICU.
- * Matches Google Calendar Taiwan formatting (e.g., "丙午年九月 - 十月", "26 (十八)", "9 (初一)").
+ * Uses UTC-noon epoch millis so ChineseCalendar converts Gregorian dates accurately
+ * (e.g. 2026-11-26 -> "丙午年十月十八", 2026-11-01 -> "廿三").
  */
 public final class LunarCalendarHelper {
 
@@ -44,7 +48,7 @@ public final class LunarCalendarHelper {
 
     private static final Map<Long, LunarInfo> CACHE = new ConcurrentHashMap<>(512);
     private static final ThreadLocal<ChineseCalendar> THREAD_CAL =
-            ThreadLocal.withInitial(ChineseCalendar::new);
+            ThreadLocal.withInitial(() -> new ChineseCalendar(TimeZone.GMT_ZONE, Locale.TAIWAN));
 
     private LunarCalendarHelper() {
     }
@@ -60,8 +64,10 @@ public final class LunarCalendarHelper {
         }
         ChineseCalendar cc = THREAD_CAL.get();
         cc.clear();
-        // Set Gregorian fields: Calendar.MONTH is 0-indexed
-        cc.set(date.getYear(), date.getMonthValue() - 1, date.getDayOfMonth());
+        // IMPORTANT: Do NOT call cc.set(y, m, d) because ChineseCalendar interprets (y,m,d)
+        // as Lunar fields! Setting epoch millis at 12:00 UTC converts from Gregorian accurately.
+        long utcNoonMillis = date.atTime(12, 0).toInstant(ZoneOffset.UTC).toEpochMilli();
+        cc.setTimeInMillis(utcNoonMillis);
 
         int extYear = cc.get(ChineseCalendar.EXTENDED_YEAR);
         int cycleIdx = Math.floorMod(extYear - 1, 60);

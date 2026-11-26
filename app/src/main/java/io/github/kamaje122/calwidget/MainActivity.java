@@ -354,10 +354,17 @@ public class MainActivity extends Activity {
         });
 
         timelineView = new MultiDayTimelineView(this);
+        timelineView.setShowPencilBadges(true);
         timelineView.setListener(new MultiDayTimelineView.Listener() {
             @Override
             public void onEventClicked(CalendarEvent event) {
                 CalendarDialogs.showEventDetailDialog(MainActivity.this, event, palette, dialogCallbacks);
+            }
+
+            @Override
+            public void onEventEditClicked(CalendarEvent event) {
+                CalendarDialogs.showEventEditorDialog(MainActivity.this, event,
+                        LocalDate.ofEpochDay(event.startEpochDay), -1, palette, dialogCallbacks);
             }
 
             @Override

@@ -44,6 +44,11 @@ public final class MultiDayTimelineView extends View {
         void onDayHeaderClicked(LocalDate date);
         void onEmptySlotClicked(LocalDate date, int hour);
         void onSwipePeriod(int deltaDays);
+
+        /** Tapped the ✎ pencil badge on an event (defaults to the normal click). */
+        default void onEventEditClicked(CalendarEvent event) {
+            onEventClicked(event);
+        }
     }
 
     private static final String[] DOW_LABELS = {
@@ -56,6 +61,7 @@ public final class MultiDayTimelineView extends View {
         final int endCol;
         int lane;
         final RectF hitRect = new RectF();
+        final RectF editHitRect = new RectF();
 
         AllDaySpan(CalendarEvent event, int startCol, int endCol) {
             this.event = event;
@@ -72,6 +78,7 @@ public final class MultiDayTimelineView extends View {
         int subCol;
         int totalSubCols;
         final RectF hitRect = new RectF();
+        final RectF editHitRect = new RectF();
 
         TimedBlock(CalendarEvent event, int col, float startMin, float endMin) {
             this.event = event;
@@ -116,6 +123,16 @@ public final class MultiDayTimelineView extends View {
     private final TextPaint eventTitlePaint = new TextPaint(Paint.ANTI_ALIAS_FLAG);
     private final TextPaint eventSubPaint = new TextPaint(Paint.ANTI_ALIAS_FLAG);
     private final RectF tmpRect = new RectF();
+
+    /** Draw a ✎ edit badge on events that are wide/tall enough. */
+    private boolean showPencilBadges = false;
+    /** When hosted inside a floating Dialog: always keep touches inside this view. */
+    private boolean floatingMode = false;
+    private boolean compactDayHeader = false;
+    private final Paint badgePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint pencilPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final android.graphics.Path pencilPath = new android.graphics.Path();
+    private final ZoneId zoneForDraw = ZoneId.systemDefault();
 
     public MultiDayTimelineView(Context context) {
         super(context);
@@ -186,20 +203,51 @@ public final class MultiDayTimelineView extends View {
         scaleDetector = new ScaleGestureDetector(context, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
             @Override
             public boolean onScale(ScaleGestureDetector detector) {
-                float factor = detector.getScaleFactor();
-                float oldHourPx = dp(hourHeightDp);
-                hourHeightDp = Math.max(38f, Math.min(104f, hourHeightDp * factor));
-                float newHourPx = dp(hourHeightDp);
-                if (oldHourPx > 0f) {
-                    float focusInTimeline = (detector.getFocusY() - getPinnedHeaderHeight()) + scrollYOffset;
-                    float ratio = newHourPx / oldHourPx;
-                    scrollYOffset = clampScroll(focusInTimeline * ratio - (detector.getFocusY() - getPinnedHeaderHeight()));
+                applyZoom(detector.getScaleFactor(), detector.getFocusY());
+                return true;
+            }
+
+            @Override
+            public boolean onScaleBegin(ScaleGestureDetector detector) {
+                if (getParent() != null) {
+                    getParent().requestDisallowInterceptTouchEvent(true);
                 }
-                AppPrefs.setHourHeightDp(getContext(), hourHeightDp);
-                invalidate();
                 return true;
             }
         });
+
+        pencilPaint.setStyle(Paint.Style.STROKE);
+        pencilPaint.setStrokeCap(Paint.Cap.ROUND);
+        pencilPaint.setStrokeJoin(Paint.Join.ROUND);
+    }
+
+    private void applyZoom(float factor, float focusY) {
+        float oldHourPx = dp(hourHeightDp);
+        hourHeightDp = Math.max(30f, Math.min(140f, hourHeightDp * factor));
+        float newHourPx = dp(hourHeightDp);
+        if (oldHourPx > 0f) {
+            float focusInView = focusY - getPinnedHeaderHeight();
+            float focusInTimeline = focusInView + scrollYOffset;
+            float ratio = newHourPx / oldHourPx;
+            scrollYOffset = clampScroll(focusInTimeline * ratio - focusInView);
+        }
+        AppPrefs.setHourHeightDp(getContext(), hourHeightDp);
+        invalidate();
+    }
+
+    /** Zoom the hour height around the viewport centre (used by −/＋ buttons). */
+    public void zoomBy(float factor) {
+        float centreY = getPinnedHeaderHeight() + (getHeight() - getPinnedHeaderHeight()) * 0.5f;
+        applyZoom(factor, centreY);
+    }
+
+    public void setShowPencilBadges(boolean show) {
+        this.showPencilBadges = show;
+        invalidate();
+    }
+
+    public void setFloatingMode(boolean floating) {
+        this.floatingMode = floating;
     }
 
     public void setListener(Listener listener) {
@@ -250,6 +298,13 @@ public final class MultiDayTimelineView extends View {
             downY = event.getY();
             swipingHorizontally = false;
             dragX = 0f;
+            if (floatingMode && getParent() != null) {
+                getParent().requestDisallowInterceptTouchEvent(true);
+            }
+        } else if (action == MotionEvent.ACTION_POINTER_DOWN) {
+            if (getParent() != null) {
+                getParent().requestDisallowInterceptTouchEvent(true);
+            }
         } else if (action == MotionEvent.ACTION_MOVE && !scaleDetector.isInProgress()) {
             float dx = event.getX() - downX;
             float dy = event.getY() - downY;
@@ -295,7 +350,13 @@ public final class MultiDayTimelineView extends View {
     }
 
     private float getDayHeaderHeight() {
-        return dp(52f);
+        return compactDayHeader ? dp(6f) : dp(52f);
+    }
+
+    /** Hide the weekday/date header row (used by the floating single-day popup, which has its own). */
+    public void setCompactDayHeader(boolean compact) {
+        this.compactDayHeader = compact;
+        invalidate();
     }
 
     private int getVisibleAllDayLanes() {
@@ -452,6 +513,12 @@ public final class MultiDayTimelineView extends View {
                 return;
             }
             for (AllDaySpan span : allDaySpans) {
+                if (!span.editHitRect.isEmpty() && span.editHitRect.contains(x, y)) {
+                    if (listener != null) listener.onEventEditClicked(span.event);
+                    return;
+                }
+            }
+            for (AllDaySpan span : allDaySpans) {
                 if (!span.hitRect.isEmpty() && span.hitRect.contains(x, y)) {
                     if (listener != null) listener.onEventClicked(span.event);
                     return;
@@ -476,6 +543,13 @@ public final class MultiDayTimelineView extends View {
         }
 
         // 3. Timed event block tap (iterate reverse for top-most Z order)
+        for (int i = timedBlocks.size() - 1; i >= 0; i--) {
+            TimedBlock b = timedBlocks.get(i);
+            if (!b.editHitRect.isEmpty() && b.editHitRect.contains(x, y)) {
+                if (listener != null) listener.onEventEditClicked(b.event);
+                return;
+            }
+        }
         for (int i = timedBlocks.size() - 1; i >= 0; i--) {
             TimedBlock b = timedBlocks.get(i);
             if (!b.hitRect.isEmpty() && b.hitRect.contains(x, y)) {
@@ -558,6 +632,7 @@ public final class MultiDayTimelineView extends View {
             // Save screen-space hit rect for tap detection
             b.hitRect.set(left + dragX, top + pinnedH - scrollYOffset,
                     right + dragX, bottom + pinnedH - scrollYOffset);
+            b.editHitRect.setEmpty();
 
             if (bottom < scrollYOffset - dp(20) || top > scrollYOffset + (h - pinnedH) + dp(20)) {
                 continue;
@@ -567,18 +642,36 @@ public final class MultiDayTimelineView extends View {
             pillPaint.setColor(b.event.color);
             canvas.drawRoundRect(tmpRect, dp(6f), dp(6f), pillPaint);
 
-            int textW = (int) ((right - left) - dp(7f));
+            boolean badge = showPencilBadges && (right - left) >= dp(56f) && (bottom - top) >= dp(24f);
+            if (badge) {
+                float r = dp(10f);
+                float cx = right - dp(3f) - r;
+                float cy = top + dp(2.5f) + r;
+                drawPencilBadge(canvas, cx, cy, r, 1f, b.event.color);
+                float half = dp(18f);
+                b.editHitRect.set(cx - half + dragX, cy - half + pinnedH - scrollYOffset,
+                        Math.min(right, cx + half) + dragX, cy + half + pinnedH - scrollYOffset);
+            }
+
+            int textW = (int) ((right - left) - dp(7f) - (badge ? dp(22f) : 0f));
             int boxH = (int) ((bottom - top) - dp(5f));
             if (textW > dp(8f) && boxH > dp(10f)) {
                 eventTitlePaint.setColor(AppTheme.textColorOnPill(b.event.color));
                 String body = b.event.title;
-                if (!TextUtils.isEmpty(b.event.location) && boxH > dp(34f)) {
+                if (columnCount == 1 && boxH > dp(30f)) {
+                    body = b.event.title + "\n" + b.event.formatTimeRange(zoneForDraw);
+                    if (!TextUtils.isEmpty(b.event.location) && boxH > dp(48f)) {
+                        body = body + "\n📍 " + b.event.location.trim();
+                    } else if (b.event.isNotion() && !TextUtils.isEmpty(b.event.statusLabel) && boxH > dp(48f)) {
+                        body = body + "\n" + b.event.statusLabel;
+                    }
+                } else if (!TextUtils.isEmpty(b.event.location) && boxH > dp(34f)) {
                     body = b.event.title + "\n" + b.event.location.trim();
                 } else if (b.event.isNotion() && !TextUtils.isEmpty(b.event.statusLabel) && boxH > dp(34f)) {
                     body = b.event.title + "\n" + b.event.statusLabel;
                 }
                 canvas.save();
-                canvas.clipRect(left + dp(3.5f), top + dp(2.5f), right - dp(2.5f), bottom - dp(2.5f));
+                canvas.clipRect(left + dp(3.5f), top + dp(2.5f), left + dp(3.5f) + textW, bottom - dp(2.5f));
                 canvas.translate(left + dp(3.5f), top + dp(2.5f));
                 StaticLayout sl = StaticLayout.Builder.obtain(body, 0, body.length(), eventTitlePaint, textW)
                         .setAlignment(Layout.Alignment.ALIGN_NORMAL)
@@ -616,7 +709,7 @@ public final class MultiDayTimelineView extends View {
         dayNumPaint.setTextSize(sp(15.5f));
         lunarPaint.setTextSize(sp(10f));
 
-        for (int c = 0; c < columnCount; c++) {
+        for (int c = 0; c < columnCount && !compactDayHeader; c++) {
             LocalDate d = startDate.plusDays(c);
             boolean isToday = d.equals(today);
             float cx = gutterW + c * colW + colW * 0.5f + dragX;
@@ -643,6 +736,7 @@ public final class MultiDayTimelineView extends View {
         for (int i = 0; i < 7; i++) colOverflowCounts[i] = 0;
         for (AllDaySpan span : allDaySpans) {
             span.hitRect.setEmpty();
+            span.editHitRect.setEmpty();
             if (span.lane >= visLanes) {
                 for (int col = span.startCol; col <= span.endCol && col < 7; col++) {
                     colOverflowCounts[col]++;
@@ -658,7 +752,16 @@ public final class MultiDayTimelineView extends View {
             pillPaint.setColor(span.event.color);
             canvas.drawRoundRect(span.hitRect, dp(5f), dp(5f), pillPaint);
 
-            float availW = (right - left) - dp(8f);
+            boolean badge = showPencilBadges && (right - left) >= dp(76f);
+            if (badge) {
+                float r = dp(7.6f);
+                float cx = right - dp(2f) - r;
+                float cy = top + dp(9.6f);
+                drawPencilBadge(canvas, cx, cy, r, 0.74f, span.event.color);
+                span.editHitRect.set(right - dp(34f), top - dp(1f), right, bottom + dp(1f));
+            }
+
+            float availW = (right - left) - dp(8f) - (badge ? dp(18f) : 0f);
             if (availW > dp(8f)) {
                 eventTitlePaint.setTextSize(sp(11f));
                 eventTitlePaint.setColor(AppTheme.textColorOnPill(span.event.color));
@@ -692,6 +795,30 @@ public final class MultiDayTimelineView extends View {
         linePaint.setColor(palette.divider);
         linePaint.setStrokeWidth(dp(1f));
         canvas.drawLine(0, pinnedH, w, pinnedH, linePaint);
+    }
+
+    /**
+     * Draws a round translucent badge with a vector ✎ pencil, coloured for contrast on the event pill.
+     */
+    private void drawPencilBadge(Canvas canvas, float cx, float cy, float radius, float scale, int pillColor) {
+        int fg = AppTheme.textColorOnPill(pillColor);
+        badgePaint.setStyle(Paint.Style.FILL);
+        badgePaint.setColor((fg & 0x00FFFFFF) | 0x33000000);
+        canvas.drawCircle(cx, cy, radius, badgePaint);
+
+        float u = dp(1f) * scale;
+        pencilPath.reset();
+        // Pencil drawn along a 45° axis: tip bottom-left, eraser top-right
+        pencilPath.moveTo(cx - 5.0f * u, cy + 5.0f * u);
+        pencilPath.lineTo(cx - 1.54f * u, cy + 4.22f * u);
+        pencilPath.lineTo(cx + 4.12f * u, cy - 1.44f * u);
+        pencilPath.lineTo(cx + 1.44f * u, cy - 4.12f * u);
+        pencilPath.lineTo(cx - 4.22f * u, cy + 1.54f * u);
+        pencilPath.close();
+        pencilPaint.setColor(fg);
+        pencilPaint.setStrokeWidth(Math.max(1f, 1.5f * u));
+        canvas.drawPath(pencilPath, pencilPaint);
+        canvas.drawLine(cx + 2.70f * u, cy - 0.02f * u, cx + 0.02f * u, cy - 2.70f * u, pencilPaint);
     }
 
     private float dp(float v) {

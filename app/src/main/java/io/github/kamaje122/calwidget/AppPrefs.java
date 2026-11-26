@@ -85,10 +85,10 @@ public final class AppPrefs {
 
     public static float getHourHeightDp(Context context) {
         float v = sp(context).getFloat(KEY_HOUR_HEIGHT_DP, 54f);
-        return Math.max(38f, Math.min(104f, v));
+        return Math.max(30f, Math.min(140f, v));
     }
 
     public static void setHourHeightDp(Context context, float dp) {
-        sp(context).edit().putFloat(KEY_HOUR_HEIGHT_DP, Math.max(38f, Math.min(104f, dp))).apply();
+        sp(context).edit().putFloat(KEY_HOUR_HEIGHT_DP, Math.max(30f, Math.min(140f, dp))).apply();
     }
 }
