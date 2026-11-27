@@ -192,6 +192,8 @@ public final class AppPrefs {
         sp(context).edit().putString(PREFIX_NOTION_REMINDERS + id, sb.toString()).apply();
     }
 
+    private static final String PREFIX_NOTION_COLOR = "notionEvtColor_";
+
     /** Resolves effective reminder offsets (minutes before start) for a Notion event. */
     public static List<Integer> getEffectiveNotionReminders(Context context, CalendarEvent ev) {
         if (ev == null) return Collections.emptyList();
@@ -206,5 +208,36 @@ public final class AppPrefs {
         List<Integer> single = new ArrayList<>(1);
         single.add(defMin);
         return single;
+    }
+
+    // ===================== Per-Event Notion Custom Color Overrides =====================
+
+    public static boolean hasCustomNotionEventColor(Context context, String notionPageId) {
+        String id = normNotionId(notionPageId);
+        return !id.isEmpty() && sp(context).contains(PREFIX_NOTION_COLOR + id);
+    }
+
+    public static int getCustomNotionEventColor(Context context, String notionPageId, int fallbackColor) {
+        String id = normNotionId(notionPageId);
+        if (id.isEmpty()) return fallbackColor;
+        SharedPreferences prefs = sp(context);
+        String key = PREFIX_NOTION_COLOR + id;
+        return prefs.contains(key) ? (prefs.getInt(key, fallbackColor) | 0xFF000000) : fallbackColor;
+    }
+
+    public static void setCustomNotionEventColor(Context context, String notionPageId, int argbColor) {
+        String id = normNotionId(notionPageId);
+        if (id.isEmpty()) return;
+        sp(context).edit().putInt(PREFIX_NOTION_COLOR + id, argbColor | 0xFF000000).apply();
+    }
+
+    public static void clearCustomNotionEventColor(Context context, String notionPageId) {
+        String id = normNotionId(notionPageId);
+        if (id.isEmpty()) return;
+        sp(context).edit().remove(PREFIX_NOTION_COLOR + id).apply();
+    }
+
+    public static int resolveNotionEventColor(Context context, String notionPageId, int sourceDefaultColor) {
+        return getCustomNotionEventColor(context, notionPageId, sourceDefaultColor);
     }
 }

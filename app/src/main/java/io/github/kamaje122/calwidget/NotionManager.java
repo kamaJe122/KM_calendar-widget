@@ -306,6 +306,19 @@ public final class NotionManager {
         prefs(context).edit().putInt(KEY_COLOR_PREFIX + sourceKey, color | 0xFF000000).apply();
     }
 
+    public static int getSourceColorByKey(Context context, String sourceKey, int fallbackColor) {
+        if (TextUtils.isEmpty(sourceKey)) return fallbackColor;
+        CachedWorkspace ws = loadCache(context);
+        if (ws != null) {
+            for (NotionSource s : ws.sources) {
+                if (sourceKey.equals(s.sourceKey)) {
+                    return getSourceColor(context, s);
+                }
+            }
+        }
+        return prefs(context).getInt(KEY_COLOR_PREFIX + sourceKey, fallbackColor) | 0xFF000000;
+    }
+
     /**
      * Full workspace discovery + event sync.
      */
@@ -1041,7 +1054,8 @@ public final class NotionManager {
             ev.statusLabel = nev.statusLabel == null ? "" : nev.statusLabel;
             ev.begin = nev.allDay ? dayStartMillis : nev.beginMillis;
             ev.end = nev.allDay ? dayEndMillis : nev.endMillis;
-            ev.color = sourceColors.getOrDefault(nev.sourceKey, NOTION_PALETTE[0]);
+            int baseColor = sourceColors.getOrDefault(nev.sourceKey, NOTION_PALETTE[0]);
+            ev.color = AppPrefs.resolveNotionEventColor(context, nev.pageId, baseColor);
             ev.title = TextUtils.isEmpty(nev.title) ? context.getString(R.string.untitled) : nev.title;
 
             StringBuilder sub = new StringBuilder();
@@ -1107,7 +1121,9 @@ public final class NotionManager {
             ce.accountName = accountLabel;
             ce.statusLabel = nev.statusLabel == null ? "" : nev.statusLabel;
             ce.notionUrl = nev.notionUrl == null ? "" : nev.notionUrl;
-            ce.color = AppTheme.normalizePillColor(sourceColors.getOrDefault(nev.sourceKey, NOTION_PALETTE[0]));
+            int baseColor = sourceColors.getOrDefault(nev.sourceKey, NOTION_PALETTE[0]);
+            ce.color = AppTheme.normalizePillColor(
+                    AppPrefs.resolveNotionEventColor(context, nev.pageId, baseColor));
             ce.allDay = nev.allDay;
             ce.startEpochDay = nev.startEpochDay;
             ce.endEpochDay = Math.max(nev.startEpochDay, nev.endEpochDay);

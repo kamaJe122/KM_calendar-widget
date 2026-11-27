@@ -62,6 +62,63 @@ public final class CalendarDataRepository {
     public static final int EDIT_SCOPE_THIS_AND_FOLLOWING = 1; // 這個和後續活動
     public static final int EDIT_SCOPE_ALL = 2;                // 所有活動
 
+    /** A selectable per-event color swatch (from CalendarContract.Colors or built-in Google-matched palette). */
+    public static final class EventColorOption {
+        /** Non-empty for synced provider color table entries (e.g. Google "1".."11"); "" for local/Notion ARGB. */
+        public final String colorKey;
+        public final int color;
+        public final String name;
+
+        public EventColorOption(String colorKey, int color, String name) {
+            this.colorKey = colorKey == null ? "" : colorKey;
+            this.color = AppTheme.normalizePillColor(color);
+            this.name = name == null ? "" : name;
+        }
+    }
+
+    /** Chosen per-event color state when saving an event (either follow calendar default or custom color). */
+    public static final class EventColorSelection {
+        public final boolean isCustom;
+        public final String colorKey;
+        public final int color;
+
+        private EventColorSelection(boolean isCustom, String colorKey, int color) {
+            this.isCustom = isCustom;
+            this.colorKey = colorKey == null ? "" : colorKey;
+            this.color = color | 0xFF000000;
+        }
+
+        public static EventColorSelection calendarDefault() {
+            return new EventColorSelection(false, "", 0);
+        }
+
+        public static EventColorSelection custom(String colorKey, int color) {
+            return new EventColorSelection(true, colorKey, color);
+        }
+    }
+
+    // Standard Google Calendar 11 Event Colors in visual spectrum order
+    private static final String[] GOOGLE_SPECTRUM_KEYS = {
+            "11", "4", "6", "5", "2", "10", "7", "9", "1", "3", "8"
+    };
+    private static final int[] DEFAULT_EVENT_COLORS = {
+            0xFFD50000, // 11 番茄紅 Tomato
+            0xFFE67C73, // 4  紅鶴粉 Flamingo
+            0xFFF4511E, // 6  柑橘橙 Tangerine
+            0xFFF6BF26, // 5  香蕉黃 Banana
+            0xFF33B679, // 2  鼠尾草綠 Sage
+            0xFF0B8043, // 10 羅勒綠 Basil
+            0xFF039BE5, // 7  孔雀藍 Peacock
+            0xFF3F51B5, // 9  藍莓藍 Blueberry
+            0xFF7986CB, // 1  薰衣草紫 Lavender
+            0xFF8E24AA, // 3  葡萄紫 Grape
+            0xFF616161  // 8  石墨灰 Graphite
+    };
+    private static final String[] DEFAULT_EVENT_COLOR_NAMES = {
+            "番茄紅", "紅鶴粉", "柑橘橙", "香蕉黃", "鼠尾草綠", "羅勒綠",
+            "孔雀藍", "藍莓藍", "薰衣草紫", "葡萄紫", "石墨灰"
+    };
+
     public static final class SystemEventMeta {
         public final long eventId;
         public final long calendarId;
@@ -88,6 +145,9 @@ public final class CalendarDataRepository {
         public int accessLevel = -1;
         public String calendarName = "";
         public int calendarColor = 0xFF4285F4;
+        public boolean hasCustomColor = false;
+        public String eventColorKey = "";
+        public int eventColor = 0;
 
         SystemEventMeta(long eventId, long calendarId, String accountName, String accountType,
                         boolean writable, boolean recurring) {
@@ -137,6 +197,89 @@ public final class CalendarDataRepository {
     public static boolean hasWritePermission(Context context) {
         return context.checkSelfPermission(Manifest.permission.WRITE_CALENDAR)
                 == PackageManager.PERMISSION_GRANTED;
+    }
+
+    /**
+     * Loads valid per-event colors for the given calendar account from `CalendarContract.Colors`
+     * (`TYPE_EVENT`, e.g. Google's 11 synced event colors), or falls back to the 11 built-in
+     * Google-Calendar-matched colors (with `colorKey = ""`) for local calendars / Notion databases.
+     */
+    public static List<EventColorOption> loadEventColorOptions(
+            Context context, String accountName, String accountType) {
+        if (!TextUtils.isEmpty(accountName) && !TextUtils.isEmpty(accountType)
+                && !CalendarContract.ACCOUNT_TYPE_LOCAL.equals(accountType)
+                && hasReadPermission(context)) {
+            Map<String, Integer> byKey = new java.util.LinkedHashMap<>();
+            String[] proj = {
+                    CalendarContract.Colors.COLOR_KEY,
+                    CalendarContract.Colors.COLOR
+            };
+            String sel = CalendarContract.Colors.ACCOUNT_NAME + " = ? AND "
+                    + CalendarContract.Colors.ACCOUNT_TYPE + " = ? AND "
+                    + CalendarContract.Colors.COLOR_TYPE + " = ?";
+            String[] args = {
+                    accountName,
+                    accountType,
+                    String.valueOf(CalendarContract.Colors.TYPE_EVENT)
+            };
+            try (Cursor c = context.getContentResolver().query(
+                    CalendarContract.Colors.CONTENT_URI, proj, sel, args, null)) {
+                if (c != null) {
+                    while (c.moveToNext()) {
+                        String key = c.getString(0);
+                        if (!TextUtils.isEmpty(key) && !c.isNull(1)) {
+                            byKey.put(key.trim(), c.getInt(1));
+                        }
+                    }
+                }
+            } catch (RuntimeException ignored) {
+            }
+
+            if (!byKey.isEmpty()) {
+                List<EventColorOption> ordered = new ArrayList<>();
+                Set<String> added = new HashSet<>();
+                for (int i = 0; i < GOOGLE_SPECTRUM_KEYS.length; i++) {
+                    String gk = GOOGLE_SPECTRUM_KEYS[i];
+                    Integer col = byKey.get(gk);
+                    if (col != null) {
+                        ordered.add(new EventColorOption(gk, col, DEFAULT_EVENT_COLOR_NAMES[i]));
+                        added.add(gk);
+                    }
+                }
+                for (Map.Entry<String, Integer> e : byKey.entrySet()) {
+                    if (added.add(e.getKey())) {
+                        ordered.add(new EventColorOption(
+                                e.getKey(), e.getValue(), nearestColorName(e.getValue())));
+                    }
+                }
+                return ordered;
+            }
+        }
+
+        List<EventColorOption> fallback = new ArrayList<>(DEFAULT_EVENT_COLORS.length);
+        for (int i = 0; i < DEFAULT_EVENT_COLORS.length; i++) {
+            fallback.add(new EventColorOption("", DEFAULT_EVENT_COLORS[i], DEFAULT_EVENT_COLOR_NAMES[i]));
+        }
+        return fallback;
+    }
+
+    public static String nearestColorName(int argb) {
+        int r = (argb >> 16) & 0xFF;
+        int g = (argb >> 8) & 0xFF;
+        int b = argb & 0xFF;
+        int bestIdx = 0;
+        int bestDist = Integer.MAX_VALUE;
+        for (int i = 0; i < DEFAULT_EVENT_COLORS.length; i++) {
+            int cr = (DEFAULT_EVENT_COLORS[i] >> 16) & 0xFF;
+            int cg = (DEFAULT_EVENT_COLORS[i] >> 8) & 0xFF;
+            int cb = DEFAULT_EVENT_COLORS[i] & 0xFF;
+            int dist = (r - cr) * (r - cr) + (g - cg) * (g - cg) + (b - cb) * (b - cb);
+            if (dist < bestDist) {
+                bestDist = dist;
+                bestIdx = i;
+            }
+        }
+        return DEFAULT_EVENT_COLOR_NAMES[bestIdx];
     }
 
     public static List<SystemCalendarItem> loadSystemCalendars(Context context) {
@@ -209,7 +352,9 @@ public final class CalendarDataRepository {
                 CalendarContract.Events._SYNC_ID,
                 CalendarContract.Events.EXDATE,
                 CalendarContract.Events.DURATION,
-                CalendarContract.Events.DTEND
+                CalendarContract.Events.DTEND,
+                CalendarContract.Events.EVENT_COLOR_KEY,
+                CalendarContract.Events.EVENT_COLOR
         };
         try (Cursor c = context.getContentResolver().query(uri, proj, null, null, null)) {
             if (c != null && c.moveToFirst()) {
@@ -251,6 +396,13 @@ public final class CalendarDataRepository {
                 m.exdate = nonNull(c.getString(18));
                 m.duration = nonNull(c.getString(19));
                 m.dtEnd = c.isNull(20) ? 0L : c.getLong(20);
+                m.eventColorKey = nonNull(c.getString(21)).trim();
+                if (!c.isNull(22)) {
+                    m.eventColor = AppTheme.normalizePillColor(c.getInt(22));
+                    m.hasCustomColor = true;
+                } else if (!m.eventColorKey.isEmpty()) {
+                    m.hasCustomColor = true;
+                }
                 return m;
             }
         } catch (RuntimeException ignored) {
@@ -564,6 +716,22 @@ public final class CalendarDataRepository {
             LocalDate endDate,
             long beginMillis,
             long endMillis) {
+        return insertSystemEvent(context, calendarId, title, location, description,
+                allDay, startDate, endDate, beginMillis, endMillis, null);
+    }
+
+    public static long insertSystemEvent(
+            Context context,
+            long calendarId,
+            String title,
+            String location,
+            String description,
+            boolean allDay,
+            LocalDate startDate,
+            LocalDate endDate,
+            long beginMillis,
+            long endMillis,
+            EventColorSelection colorSelection) {
         if (!hasWritePermission(context)) return -1L;
         try {
             ContentValues cv = new ContentValues();
@@ -572,6 +740,7 @@ public final class CalendarDataRepository {
             cv.put(CalendarContract.Events.EVENT_LOCATION, location == null ? "" : location);
             cv.put(CalendarContract.Events.DESCRIPTION, description == null ? "" : description);
             populateEventTimeValues(cv, allDay, startDate, endDate, beginMillis, endMillis);
+            applyEventColorValues(cv, colorSelection, true);
 
             ContentResolver cr = context.getContentResolver();
             Uri uri = cr.insert(CalendarContract.Events.CONTENT_URI, cv);
@@ -586,17 +755,6 @@ public final class CalendarDataRepository {
         return -1L;
     }
 
-    /**
-     * Updates a system / Google Calendar event with Google-Calendar-style recurrence scopes and
-     * immediately requests an expedited sync back to the source account.
-     *
-     * @param scope              {@link #EDIT_SCOPE_SINGLE}, {@link #EDIT_SCOPE_THIS_AND_FOLLOWING}
-     *                           or {@link #EDIT_SCOPE_ALL} (ignored for non-recurring events)
-     * @param instanceBeginMillis BEGIN of the tapped instance (from CalendarContract.Instances)
-     * @param instanceAllDay      ALL_DAY of the tapped instance
-     * @return the event row id that now represents the edited occurrence (use it for reminders),
-     * or -1 on failure.
-     */
     public static long updateSystemEvent(
             Context context,
             SystemEventMeta meta,
@@ -612,6 +770,30 @@ public final class CalendarDataRepository {
             LocalDate endDate,
             long beginMillis,
             long endMillis) {
+        return updateSystemEvent(context, meta, scope, targetCalendarId, instanceBeginMillis, instanceAllDay,
+                title, location, description, allDay, startDate, endDate, beginMillis, endMillis, null);
+    }
+
+    /**
+     * Updates a system / Google Calendar event with Google-Calendar-style recurrence scopes and
+     * optional per-event color override, immediately pushing expedited sync back to the account.
+     */
+    public static long updateSystemEvent(
+            Context context,
+            SystemEventMeta meta,
+            int scope,
+            long targetCalendarId,
+            long instanceBeginMillis,
+            boolean instanceAllDay,
+            String title,
+            String location,
+            String description,
+            boolean allDay,
+            LocalDate startDate,
+            LocalDate endDate,
+            long beginMillis,
+            long endMillis,
+            EventColorSelection colorSelection) {
         if (meta == null || meta.eventId < 0 || !hasWritePermission(context)) return -1L;
         ContentResolver cr = context.getContentResolver();
         long syncCal = meta.calendarId > 0 ? meta.calendarId : targetCalendarId;
@@ -629,7 +811,7 @@ public final class CalendarDataRepository {
                 series = inspectSystemEvent(context, meta.originalId);
                 if (series == null) {
                     boolean ok = plainUpdate(context, meta, -1L, title, location, description,
-                            allDay, startDate, endDate, beginMillis, endMillis);
+                            allDay, startDate, endDate, beginMillis, endMillis, colorSelection);
                     if (ok) finishMutation(context, syncCal);
                     return ok ? meta.eventId : -1L;
                 }
@@ -639,7 +821,7 @@ public final class CalendarDataRepository {
                 // Plain single event, or an already-detached exception edited "only this one"
                 long calTarget = meta.isException() ? -1L : targetCalendarId;
                 boolean ok = plainUpdate(context, meta, calTarget, title, location, description,
-                        allDay, startDate, endDate, beginMillis, endMillis);
+                        allDay, startDate, endDate, beginMillis, endMillis, colorSelection);
                 if (ok) finishMutation(context, calTarget > 0 ? calTarget : syncCal);
                 return ok ? meta.eventId : -1L;
             }
@@ -655,6 +837,8 @@ public final class CalendarDataRepository {
                 ex.put(CalendarContract.Events.EVENT_LOCATION, location == null ? "" : location);
                 ex.put(CalendarContract.Events.DESCRIPTION, description == null ? "" : description);
                 populateEventTimeValues(ex, allDay, startDate, endDate, beginMillis, endMillis);
+                // Pass false for isInsert so resetting to calendar default overrides cloned master color!
+                applyEventColorValues(ex, colorSelection, false);
                 // CalendarProvider2.handleInsertException computes DTEND from DURATION before stripping DURATION!
                 ex.put(CalendarContract.Events.DURATION,
                         computeDurationString(allDay, startDate, endDate, beginMillis, endMillis));
@@ -664,7 +848,8 @@ public final class CalendarDataRepository {
             } else if (scope == EDIT_SCOPE_THIS_AND_FOLLOWING
                     && origInstance > series.dtStart + 999L) {
                 resultId = splitSeriesAndInsertFollowing(context, series, origInstance, origAllDay,
-                        title, location, description, allDay, startDate, endDate, beginMillis, endMillis);
+                        title, location, description, allDay, startDate, endDate, beginMillis, endMillis,
+                        colorSelection);
                 if (resultId >= 0) {
                     // Delete ALL detached exceptions belonging to the old series at or after the split point
                     deleteDetachedExceptionsAtOrAfter(cr, series, origInstance);
@@ -672,10 +857,11 @@ public final class CalendarDataRepository {
             } else {
                 // EDIT_SCOPE_ALL (or "this & following" on the very first occurrence == whole series)
                 boolean ok = updateWholeSeries(context, series, origInstance, origAllDay,
-                        title, location, description, allDay, startDate, endDate, beginMillis, endMillis);
+                        title, location, description, allDay, startDate, endDate, beginMillis, endMillis,
+                        colorSelection);
                 if (ok && meta.isException()) {
                     plainUpdate(context, meta, -1L, title, location, description,
-                            allDay, startDate, endDate, beginMillis, endMillis);
+                            allDay, startDate, endDate, beginMillis, endMillis, colorSelection);
                 }
                 resultId = ok ? series.eventId : -1L;
             }
@@ -708,13 +894,30 @@ public final class CalendarDataRepository {
         if (meta == null) return false;
         int scope = onlyThisInstance ? EDIT_SCOPE_SINGLE : EDIT_SCOPE_ALL;
         return updateSystemEvent(context, meta, scope, targetCalendarId, originalBeginMillis, originalAllDay,
-                title, location, description, allDay, startDate, endDate, beginMillis, endMillis) >= 0;
+                title, location, description, allDay, startDate, endDate, beginMillis, endMillis, null) >= 0;
+    }
+
+    private static void applyEventColorValues(
+            ContentValues cv, EventColorSelection colorSel, boolean isBrandNewInsert) {
+        if (colorSel == null) return;
+        if (colorSel.isCustom) {
+            if (!TextUtils.isEmpty(colorSel.colorKey)) {
+                cv.put(CalendarContract.Events.EVENT_COLOR_KEY, colorSel.colorKey);
+            } else if (!isBrandNewInsert) {
+                cv.putNull(CalendarContract.Events.EVENT_COLOR_KEY);
+            }
+            cv.put(CalendarContract.Events.EVENT_COLOR, colorSel.color);
+        } else if (!isBrandNewInsert) {
+            cv.putNull(CalendarContract.Events.EVENT_COLOR_KEY);
+            cv.putNull(CalendarContract.Events.EVENT_COLOR);
+        }
     }
 
     private static boolean plainUpdate(
             Context context, SystemEventMeta meta, long targetCalendarId,
             String title, String location, String description,
-            boolean allDay, LocalDate startDate, LocalDate endDate, long beginMillis, long endMillis) {
+            boolean allDay, LocalDate startDate, LocalDate endDate, long beginMillis, long endMillis,
+            EventColorSelection colorSelection) {
         ContentValues cv = new ContentValues();
         if (targetCalendarId > 0 && !meta.isException()) {
             cv.put(CalendarContract.Events.CALENDAR_ID, targetCalendarId);
@@ -724,6 +927,7 @@ public final class CalendarDataRepository {
         cv.put(CalendarContract.Events.DESCRIPTION, description == null ? "" : description);
         populateEventTimeValues(cv, allDay, startDate, endDate, beginMillis, endMillis);
         cv.putNull(CalendarContract.Events.DURATION);
+        applyEventColorValues(cv, colorSelection, false);
         if (meta.isException()) {
             // CalendarInstancesHelper.updateInstancesLocked inspects modValues directly to detect
             // recurrence exceptions; preserve linkage keys so Instances re-expands properly.
@@ -745,7 +949,8 @@ public final class CalendarDataRepository {
     private static boolean updateWholeSeries(
             Context context, SystemEventMeta series, long origInstance, boolean origAllDay,
             String title, String location, String description,
-            boolean allDay, LocalDate startDate, LocalDate endDate, long beginMillis, long endMillis) {
+            boolean allDay, LocalDate startDate, LocalDate endDate, long beginMillis, long endMillis,
+            EventColorSelection colorSelection) {
         ZoneId zone = ZoneId.systemDefault();
         LocalDate origInstanceDate = toLocalDate(origInstance, origAllDay, zone);
         long dayShift = startDate.toEpochDay() - origInstanceDate.toEpochDay();
@@ -756,6 +961,7 @@ public final class CalendarDataRepository {
         cv.put(CalendarContract.Events.EVENT_LOCATION, location == null ? "" : location);
         cv.put(CalendarContract.Events.DESCRIPTION, description == null ? "" : description);
         putSeriesTiming(cv, allDay, masterDate, startDate, endDate, beginMillis, endMillis, zone);
+        applyEventColorValues(cv, colorSelection, false);
 
         // CRITICAL: Android's CalendarInstancesHelper.updateInstancesLocked(modValues, ...) checks
         // modValues (not the DB row!) for RRULE/RDATE right after deleting existing Instances when
@@ -781,7 +987,8 @@ public final class CalendarDataRepository {
     private static long splitSeriesAndInsertFollowing(
             Context context, SystemEventMeta series, long origInstance, boolean origAllDay,
             String title, String location, String description,
-            boolean allDay, LocalDate startDate, LocalDate endDate, long beginMillis, long endMillis) {
+            boolean allDay, LocalDate startDate, LocalDate endDate, long beginMillis, long endMillis,
+            EventColorSelection colorSelection) {
         ContentResolver cr = context.getContentResolver();
         ZoneId zone = ZoneId.systemDefault();
         Map<String, String> parts = parseRRule(series.rrule);
@@ -807,6 +1014,7 @@ public final class CalendarDataRepository {
         nv.put(CalendarContract.Events.DESCRIPTION, description == null ? "" : description);
         nv.put(CalendarContract.Events.RRULE, newRule);
         putSeriesTiming(nv, allDay, startDate, startDate, endDate, beginMillis, endMillis, zone);
+        applyEventColorValues(nv, colorSelection, true);
         if (series.availability >= 0) nv.put(CalendarContract.Events.AVAILABILITY, series.availability);
         if (series.accessLevel >= 0) nv.put(CalendarContract.Events.ACCESS_LEVEL, series.accessLevel);
         long newId = parseId(cr.insert(CalendarContract.Events.CONTENT_URI, nv));

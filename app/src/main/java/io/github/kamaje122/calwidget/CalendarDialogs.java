@@ -447,6 +447,36 @@ public final class CalendarDialogs {
         final boolean[] targetNotion = {editingNotion
                 || (!isEdit && !destinations.isEmpty() && destinations.get(0).isNotion)};
 
+        // ---- Per-event custom color state (Google Colors table + Notion custom override)
+        final int initialBaseCalColor;
+        if (editingNotion) {
+            initialBaseCalColor = NotionManager.getSourceColorByKey(
+                    activity, existingEvent.sourceKey, existingEvent.color);
+        } else if (editingSystem && sysMeta != null) {
+            initialBaseCalColor = sysMeta.calendarColor;
+        } else if (!destinations.isEmpty()) {
+            initialBaseCalColor = destinations.get(0).color;
+        } else {
+            initialBaseCalColor = isEdit ? existingEvent.color : palette.todayFill;
+        }
+        final int[] baseCalColor = {initialBaseCalColor};
+        final boolean[] customColorEnabled = {false};
+        final String[] chosenColorKey = {""};
+        final int[] chosenCustomColor = {initialBaseCalColor};
+        final String[] chosenColorName = {""};
+        final List<CalendarDataRepository.EventColorOption> colorPalette = new ArrayList<>();
+
+        if (editingSystem && sysMeta != null && sysMeta.hasCustomColor) {
+            customColorEnabled[0] = true;
+            chosenColorKey[0] = sysMeta.eventColorKey;
+            chosenCustomColor[0] = sysMeta.eventColor != 0 ? sysMeta.eventColor : existingEvent.color;
+        } else if (editingNotion && AppPrefs.hasCustomNotionEventColor(activity, existingEvent.notionPageId)) {
+            customColorEnabled[0] = true;
+            chosenColorKey[0] = "";
+            chosenCustomColor[0] = AppPrefs.getCustomNotionEventColor(
+                    activity, existingEvent.notionPageId, existingEvent.color);
+        }
+
         final boolean[] userTouchedReminders = {false};
         final List<Integer> reminders = new ArrayList<>();
         final List<Integer> originalReminders = new ArrayList<>();
@@ -541,17 +571,17 @@ public final class CalendarDialogs {
             body.addView(ro, roLp);
         }
 
-        // ---- Title (large, borderless) with colour square like Google
+        // ---- Title (large, borderless) with tappable colour square like Google Calendar
         LinearLayout titleRow = new LinearLayout(activity);
         titleRow.setOrientation(LinearLayout.HORIZONTAL);
         titleRow.setGravity(Gravity.CENTER_VERTICAL);
         View colorSquare = new View(activity);
-        int initialColor = isEdit ? existingEvent.color
-                : (!destinations.isEmpty() ? destinations.get(0).color : palette.todayFill);
-        colorSquare.setBackground(roundedBg(initialColor, dp(activity, 5)));
-        LinearLayout.LayoutParams csLp = new LinearLayout.LayoutParams(dp(activity, 16), dp(activity, 16));
-        csLp.setMarginStart(dp(activity, 14));
-        csLp.setMarginEnd(dp(activity, 14));
+        int initialColor = customColorEnabled[0] ? chosenCustomColor[0] : initialBaseCalColor;
+        colorSquare.setBackground(roundedBg(initialColor, dp(activity, 6)));
+        colorSquare.setContentDescription("點選設定活動顏色");
+        LinearLayout.LayoutParams csLp = new LinearLayout.LayoutParams(dp(activity, 20), dp(activity, 20));
+        csLp.setMarginStart(dp(activity, 12));
+        csLp.setMarginEnd(dp(activity, 12));
         titleRow.addView(colorSquare, csLp);
 
         final boolean[] userEditedTitle = {false};
@@ -756,11 +786,173 @@ public final class CalendarDialogs {
         }
         calContent.addView(calSubTv);
         View calDot = new View(activity);
-        calDot.setBackground(roundedBg(initialColor, dp(activity, 7)));
+        calDot.setBackground(roundedBg(initialBaseCalColor, dp(activity, 7)));
         LinearLayout calRow = makeSheetRowWithIconView(activity, calDot, calContent);
         body.addView(calRow);
 
-        // ---- 🔔 Reminders (Google / system only)
+        // ---- 🎨 Per-Event Color Picker Row (Google Calendar 11 Event Colors + Notion per-event color)
+        LinearLayout colorCol = new LinearLayout(activity);
+        colorCol.setOrientation(LinearLayout.VERTICAL);
+        colorCol.setPadding(0, dp(activity, 2), 0, dp(activity, 4));
+
+        TextView colorLabelTv = new TextView(activity);
+        colorLabelTv.setTextSize(14.5f);
+        colorLabelTv.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        colorLabelTv.setTextColor(palette.textPrimary);
+        colorLabelTv.setPadding(0, dp(activity, 4), 0, dp(activity, 6));
+        colorCol.addView(colorLabelTv);
+
+        LinearLayout swatchStrip = new LinearLayout(activity);
+        swatchStrip.setOrientation(LinearLayout.HORIZONTAL);
+        swatchStrip.setGravity(Gravity.CENTER_VERTICAL);
+        swatchStrip.setPadding(0, dp(activity, 2), dp(activity, 6), dp(activity, 4));
+
+        HorizontalScrollView swatchScroll = new HorizontalScrollView(activity);
+        swatchScroll.setHorizontalScrollBarEnabled(false);
+        swatchScroll.addView(swatchStrip);
+        if (!readOnly) {
+            colorCol.addView(swatchScroll);
+        }
+
+        View eventColorDot = new View(activity);
+        eventColorDot.setBackground(roundedBg(initialColor, dp(activity, 7)));
+        LinearLayout colorRow = makeSheetRowWithIconView(activity, eventColorDot, colorCol);
+        if (readOnly && !customColorEnabled[0]) {
+            colorRow.setVisibility(View.GONE);
+        }
+        body.addView(colorRow);
+
+        final Runnable[] renderColorPicker = new Runnable[1];
+        final Runnable openColorListDialog = () -> {
+            if (readOnly) return;
+            String defLabel = targetNotion[0] ? "預設顏色（跟隨資料庫顏色）" : "預設顏色（跟隨所屬日曆）";
+            CharSequence[] items = new CharSequence[colorPalette.size() + 1];
+            SpannableString defSpan = new SpannableString("●  " + defLabel);
+            defSpan.setSpan(new ForegroundColorSpan(baseCalColor[0]), 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            items[0] = defSpan;
+
+            int checkedIdx = 0;
+            for (int i = 0; i < colorPalette.size(); i++) {
+                CalendarDataRepository.EventColorOption opt = colorPalette.get(i);
+                SpannableString sp = new SpannableString("●  " + opt.name);
+                sp.setSpan(new ForegroundColorSpan(opt.color), 0, 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                items[i + 1] = sp;
+                if (customColorEnabled[0]) {
+                    boolean match = (!TextUtils.isEmpty(chosenColorKey[0])
+                            && chosenColorKey[0].equals(opt.colorKey))
+                            || (opt.color == chosenCustomColor[0]);
+                    if (match && checkedIdx == 0) checkedIdx = i + 1;
+                }
+            }
+
+            new AlertDialog.Builder(activity)
+                    .setTitle("選擇此行程專屬顏色")
+                    .setSingleChoiceItems(items, checkedIdx, (d, which) -> {
+                        if (which == 0) {
+                            customColorEnabled[0] = false;
+                            chosenColorKey[0] = "";
+                            chosenColorName[0] = "";
+                        } else {
+                            CalendarDataRepository.EventColorOption picked = colorPalette.get(which - 1);
+                            customColorEnabled[0] = true;
+                            chosenColorKey[0] = picked.colorKey;
+                            chosenCustomColor[0] = picked.color;
+                            chosenColorName[0] = picked.name;
+                        }
+                        renderColorPicker[0].run();
+                        d.dismiss();
+                    })
+                    .setNegativeButton("取消", null)
+                    .show();
+        };
+
+        if (!readOnly) {
+            applyRipple(colorLabelTv, false);
+            colorLabelTv.setOnClickListener(v -> openColorListDialog.run());
+            colorSquare.setClickable(true);
+            colorSquare.setFocusable(true);
+            colorSquare.setOnClickListener(v -> openColorListDialog.run());
+        }
+
+        renderColorPicker[0] = () -> {
+            int effective = customColorEnabled[0] ? chosenCustomColor[0] : baseCalColor[0];
+            colorSquare.setBackground(roundedBg(effective, dp(activity, 6)));
+            eventColorDot.setBackground(roundedBg(effective, dp(activity, 7)));
+            calDot.setBackground(roundedBg(baseCalColor[0], dp(activity, 7)));
+
+            String defShort = targetNotion[0] ? "跟隨資料庫預設" : "跟隨日曆預設";
+            if (!customColorEnabled[0]) {
+                colorLabelTv.setText("活動顏色：預設（" + defShort + "）" + (readOnly ? "" : " ▾"));
+            } else {
+                String cName = !TextUtils.isEmpty(chosenColorName[0])
+                        ? chosenColorName[0]
+                        : CalendarDataRepository.nearestColorName(chosenCustomColor[0]);
+                colorLabelTv.setText("活動顏色：" + cName + (readOnly ? "" : " ▾"));
+            }
+
+            if (readOnly) return;
+            swatchStrip.removeAllViews();
+            int size = dp(activity, 34);
+            int gap = dp(activity, 8);
+            int subtleBorder = palette.isDark ? 0x33FFFFFF : 0x26000000;
+
+            // Swatch 0: Default (follow calendar / Notion database color)
+            TextView defCircle = new TextView(activity);
+            defCircle.setGravity(Gravity.CENTER);
+            defCircle.setTypeface(Typeface.DEFAULT_BOLD);
+            boolean defSelected = !customColorEnabled[0];
+            defCircle.setText(defSelected ? "✓" : "預");
+            defCircle.setTextSize(defSelected ? 15f : 11f);
+            defCircle.setTextColor(AppTheme.textColorOnPill(baseCalColor[0]));
+            GradientDrawable defBg = new GradientDrawable();
+            defBg.setShape(GradientDrawable.OVAL);
+            defBg.setColor(baseCalColor[0]);
+            defBg.setStroke(dp(activity, defSelected ? 3 : 1),
+                    defSelected ? palette.textPrimary : subtleBorder);
+            defCircle.setBackground(defBg);
+            defCircle.setContentDescription("預設顏色（" + defShort + "）");
+            defCircle.setOnClickListener(v -> {
+                customColorEnabled[0] = false;
+                chosenColorKey[0] = "";
+                chosenColorName[0] = "";
+                renderColorPicker[0].run();
+            });
+            LinearLayout.LayoutParams dLp = new LinearLayout.LayoutParams(size, size);
+            dLp.setMarginEnd(gap);
+            swatchStrip.addView(defCircle, dLp);
+
+            // Swatches 1..N: Individual event colors
+            for (CalendarDataRepository.EventColorOption opt : colorPalette) {
+                boolean selected = customColorEnabled[0] && (
+                        (!TextUtils.isEmpty(chosenColorKey[0]) && chosenColorKey[0].equals(opt.colorKey))
+                                || (TextUtils.isEmpty(chosenColorKey[0]) && opt.color == chosenCustomColor[0]));
+                TextView sw = new TextView(activity);
+                sw.setGravity(Gravity.CENTER);
+                sw.setTypeface(Typeface.DEFAULT_BOLD);
+                sw.setText(selected ? "✓" : "");
+                sw.setTextSize(15f);
+                sw.setTextColor(AppTheme.textColorOnPill(opt.color));
+                GradientDrawable bg = new GradientDrawable();
+                bg.setShape(GradientDrawable.OVAL);
+                bg.setColor(opt.color);
+                bg.setStroke(dp(activity, selected ? 3 : 1),
+                        selected ? palette.textPrimary : subtleBorder);
+                sw.setBackground(bg);
+                sw.setContentDescription(opt.name);
+                sw.setOnClickListener(v -> {
+                    customColorEnabled[0] = true;
+                    chosenColorKey[0] = opt.colorKey;
+                    chosenCustomColor[0] = opt.color;
+                    chosenColorName[0] = opt.name;
+                    renderColorPicker[0].run();
+                });
+                LinearLayout.LayoutParams sLp = new LinearLayout.LayoutParams(size, size);
+                sLp.setMarginEnd(gap);
+                swatchStrip.addView(sw, sLp);
+            }
+        };
+
+        // ---- 🔔 Reminders (Google / system + Notion)
         LinearLayout reminderSection = new LinearLayout(activity);
         reminderSection.setOrientation(LinearLayout.VERTICAL);
         View reminderDivider = makeDivider(activity, palette);
@@ -855,9 +1047,55 @@ public final class CalendarDialogs {
             boolean notion = targetNotion[0];
             TargetDestination td = (showDestSpinner && !destinations.isEmpty())
                     ? destinations.get(Math.max(0, destSpinner.getSelectedItemPosition())) : null;
-            int color = td != null ? td.color : initialColor;
-            colorSquare.setBackground(roundedBg(color, dp(activity, 5)));
-            calDot.setBackground(roundedBg(color, dp(activity, 7)));
+            baseCalColor[0] = td != null ? td.color : initialBaseCalColor;
+
+            String accName = "";
+            String acctType = "";
+            if (!notion) {
+                if (td != null && td.sysCal != null) {
+                    accName = td.sysCal.accountName;
+                    acctType = td.sysCal.accountType;
+                } else if (sysMeta != null) {
+                    accName = sysMeta.accountName;
+                    acctType = sysMeta.accountType;
+                }
+            }
+            colorPalette.clear();
+            colorPalette.addAll(CalendarDataRepository.loadEventColorOptions(activity, accName, acctType));
+
+            // Re-align selected custom color against active destination's colorPalette so colorKey is valid
+            if (customColorEnabled[0] && !colorPalette.isEmpty()) {
+                CalendarDataRepository.EventColorOption matched = null;
+                if (!TextUtils.isEmpty(chosenColorKey[0])) {
+                    for (CalendarDataRepository.EventColorOption o : colorPalette) {
+                        if (chosenColorKey[0].equals(o.colorKey)) {
+                            matched = o;
+                            break;
+                        }
+                    }
+                }
+                if (matched == null) {
+                    String targetName = !TextUtils.isEmpty(chosenColorName[0])
+                            ? chosenColorName[0]
+                            : CalendarDataRepository.nearestColorName(chosenCustomColor[0]);
+                    for (CalendarDataRepository.EventColorOption o : colorPalette) {
+                        if (o.color == chosenCustomColor[0] || targetName.equals(o.name)) {
+                            matched = o;
+                            break;
+                        }
+                    }
+                }
+                if (matched != null) {
+                    chosenColorKey[0] = matched.colorKey;
+                    chosenCustomColor[0] = matched.color;
+                    chosenColorName[0] = matched.name;
+                } else {
+                    chosenColorKey[0] = "";
+                    chosenColorName[0] = CalendarDataRepository.nearestColorName(chosenCustomColor[0]);
+                }
+            }
+            renderColorPicker[0].run();
+
             locRow.setVisibility(notion ? View.GONE : View.VISIBLE);
             reminderRow.setVisibility(View.VISIBLE);
             reminderDivider.setVisibility(View.VISIBLE);
@@ -870,8 +1108,6 @@ public final class CalendarDialogs {
             if (!notion) statusRow.setVisibility(View.GONE);
             if (!notion) computedDateHint.setVisibility(View.GONE);
             descInput.setHint(notion ? "Notion 備註／說明（若資料庫有文字欄位將同步）" : "新增說明");
-            String acctType = sysMeta != null ? sysMeta.accountType
-                    : (td != null && td.sysCal != null ? td.sysCal.accountType : "");
             boolean google = acctType != null && acctType.contains("google");
             sourceChip.setText(notion ? "📓 Notion" : (google ? "📅 Google 活動" : "📅 活動"));
             calSubTv.setText(notion ? "Notion 資料庫 · 儲存後直接寫回 Notion"
@@ -1043,6 +1279,7 @@ public final class CalendarDialogs {
                                     new NotionManager.MutationCallback() {
                                         @Override
                                         public void onSuccess() {
+                                            AppPrefs.clearCustomNotionEventColor(activity, existingEvent.notionPageId);
                                             dialog.dismiss();
                                             Toast.makeText(activity, "✅ 已從 Notion 移至垃圾桶", Toast.LENGTH_SHORT).show();
                                             callbacks.onEventsMutated();
@@ -1113,9 +1350,18 @@ public final class CalendarDialogs {
                 NotionManager.MutationCallback mutCb = new NotionManager.MutationCallback() {
                     @Override
                     public void onSuccess() {
-                        if (editingNotion && userTouchedReminders[0] && !TextUtils.isEmpty(existingEvent.notionPageId)) {
-                            AppPrefs.setCustomNotionReminders(activity, existingEvent.notionPageId, reminders);
+                        if (editingNotion && !TextUtils.isEmpty(existingEvent.notionPageId)) {
+                            if (userTouchedReminders[0]) {
+                                AppPrefs.setCustomNotionReminders(activity, existingEvent.notionPageId, reminders);
+                            }
+                            if (customColorEnabled[0]) {
+                                AppPrefs.setCustomNotionEventColor(
+                                        activity, existingEvent.notionPageId, chosenCustomColor[0]);
+                            } else {
+                                AppPrefs.clearCustomNotionEventColor(activity, existingEvent.notionPageId);
+                            }
                         }
+                        CalendarWidgetProvider.updateAll(activity);
                         EventReminderManager.scheduleAsync(activity);
                         dialog.dismiss();
                         Toast.makeText(activity,
@@ -1126,8 +1372,13 @@ public final class CalendarDialogs {
 
                     @Override
                     public void onCreatedPage(String pageId) {
-                        if (userTouchedReminders[0] && !TextUtils.isEmpty(pageId)) {
-                            AppPrefs.setCustomNotionReminders(activity, pageId, reminders);
+                        if (!TextUtils.isEmpty(pageId)) {
+                            if (userTouchedReminders[0]) {
+                                AppPrefs.setCustomNotionReminders(activity, pageId, reminders);
+                            }
+                            if (customColorEnabled[0]) {
+                                AppPrefs.setCustomNotionEventColor(activity, pageId, chosenCustomColor[0]);
+                            }
                         }
                         onSuccess();
                     }
@@ -1160,6 +1411,9 @@ public final class CalendarDialogs {
             final String descVal = descInput.getText().toString().trim();
             final long beginMs = finalBegin.toInstant().toEpochMilli();
             final long endMs = finalEnd.toInstant().toEpochMilli();
+            final CalendarDataRepository.EventColorSelection colorSel = customColorEnabled[0]
+                    ? CalendarDataRepository.EventColorSelection.custom(chosenColorKey[0], chosenCustomColor[0])
+                    : CalendarDataRepository.EventColorSelection.calendarDefault();
 
             if (!isEdit) {
                 if (chosenDest == null || chosenDest.sysCal == null) {
@@ -1178,7 +1432,7 @@ public final class CalendarDialogs {
                     return;
                 }
                 long newId = CalendarDataRepository.insertSystemEvent(activity, chosenDest.sysCal.id,
-                        title, locVal, descVal, ad, startDate[0], endDate[0], beginMs, endMs);
+                        title, locVal, descVal, ad, startDate[0], endDate[0], beginMs, endMs, colorSel);
                 if (newId >= 0) {
                     if (!reminders.isEmpty()) {
                         CalendarDataRepository.saveEventReminders(activity, newId, reminders);
@@ -1201,7 +1455,7 @@ public final class CalendarDialogs {
             java.util.function.IntConsumer doUpdate = scope -> {
                 long resultId = CalendarDataRepository.updateSystemEvent(activity, sysMeta, scope,
                         targetCalId, existingEvent.beginMillis, existingEvent.allDay,
-                        title, locVal, descVal, ad, startDate[0], endDate[0], beginMs, endMs);
+                        title, locVal, descVal, ad, startDate[0], endDate[0], beginMs, endMs, colorSel);
                 if (resultId >= 0) {
                     boolean newRow = resultId != existingEvent.eventId;
                     if (remindersChanged || (newRow && !reminders.isEmpty())) {
