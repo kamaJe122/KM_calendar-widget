@@ -148,4 +148,42 @@ public final class AppTheme {
     public static int normalizePillColor(int rawColor) {
         return rawColor | 0xFF000000;
     }
+
+    /**
+     * Lowers chromatic saturation for past dates (yesterday and earlier) using luminance-preserving
+     * desaturation plus a gentle blend toward the muted past-cell card background, preserving each
+     * event's hue identity and text contrast in both Light and Dark themes.
+     */
+    public static int pastPillColor(int rawColor, Palette palette) {
+        int c = normalizePillColor(rawColor);
+        int r = Color.red(c);
+        int g = Color.green(c);
+        int b = Color.blue(c);
+        float lum = 0.299f * r + 0.587f * g + 0.114f * b;
+
+        float chromaKeep = 0.44f;
+        float grayMix = 1f - chromaKeep;
+        float dr = r * chromaKeep + lum * grayMix;
+        float dg = g * chromaKeep + lum * grayMix;
+        float db = b * chromaKeep + lum * grayMix;
+
+        int bg = palette.bgCellOutsideMonth;
+        float cellKeep = palette.isDark ? 0.80f : 0.84f;
+        float cellMix = 1f - cellKeep;
+        int outR = Math.round(dr * cellKeep + Color.red(bg) * cellMix);
+        int outG = Math.round(dg * cellKeep + Color.green(bg) * cellMix);
+        int outB = Math.round(db * cellKeep + Color.blue(bg) * cellMix);
+
+        return Color.rgb(
+                Math.max(0, Math.min(255, outR)),
+                Math.max(0, Math.min(255, outG)),
+                Math.max(0, Math.min(255, outB))
+        );
+    }
+
+    /** Softens pill label contrast slightly on desaturated past-date event pills. */
+    public static int pastTextColorOnPill(int origBgColor) {
+        int main = textColorOnPill(origBgColor);
+        return main == 0xFF1F1F1F ? 0xBF1F1F1F : 0xEEFFFFFF;
+    }
 }

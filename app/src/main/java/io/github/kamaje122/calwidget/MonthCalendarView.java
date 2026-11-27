@@ -250,14 +250,16 @@ public final class MonthCalendarView extends View {
                 boolean inMonth = d.getMonthValue() == currentMonth.getMonthValue()
                         && d.getYear() == currentMonth.getYear();
                 boolean isToday = d.equals(today);
+                boolean isPast = d.isBefore(today);
                 boolean isSelected = d.equals(selectedDate);
 
                 float left = c * colW;
                 float right = left + colW;
 
-                // Rounded day cell card
+                // Rounded day cell card: past days (yesterday and earlier) use muted card background;
+                // today and all future days (including upcoming next-month days) stay crisp & bright.
                 tmpRect.set(left + cellGap, top + cellGap, right - cellGap, bottom - cellGap);
-                cellPaint.setColor(inMonth ? palette.bgCell : palette.bgCellOutsideMonth);
+                cellPaint.setColor(isPast ? palette.bgCellOutsideMonth : palette.bgCell);
                 canvas.drawRoundRect(tmpRect, cellRadius, cellRadius, cellPaint);
 
                 if (isSelected && !isToday) {
@@ -266,8 +268,11 @@ public final class MonthCalendarView extends View {
                     canvas.drawRoundRect(tmpRect, cellRadius, cellRadius, strokePaint);
                 }
 
-                // Day + Lunar text: e.g. "26 (十八)"
-                String dayLabel = d.getDayOfMonth() + " (" + LunarCalendarHelper.getDayShort(d) + ")";
+                // Day + Lunar text: e.g. "26 (十八)", or "12/1 (廿三)" on month boundary outside currentMonth
+                String dayPrefix = (!inMonth && d.getDayOfMonth() == 1)
+                        ? (d.getMonthValue() + "/" + d.getDayOfMonth())
+                        : String.valueOf(d.getDayOfMonth());
+                String dayLabel = dayPrefix + " (" + LunarCalendarHelper.getDayShort(d) + ")";
                 float centerX = (left + right) * 0.5f;
                 float textBaseline = top + dp(16.2f);
 
@@ -285,10 +290,10 @@ public final class MonthCalendarView extends View {
                     pillPaint.setColor(palette.todayFill);
                     canvas.drawRoundRect(tmpRect, dp(9f), dp(9f), pillPaint);
                     dayLabelPaint.setColor(palette.todayText);
-                } else if (inMonth) {
-                    dayLabelPaint.setColor(palette.textPrimary);
-                } else {
+                } else if (isPast) {
                     dayLabelPaint.setColor(palette.textDim);
+                } else {
+                    dayLabelPaint.setColor(palette.textPrimary);
                 }
                 canvas.drawText(dayLabel, centerX, textBaseline, dayLabelPaint);
 
@@ -313,16 +318,17 @@ public final class MonthCalendarView extends View {
                     float pRight = continuesRight ? (right - dp(0.5f)) : (right - dp(3f));
                     tmpRect.set(pLeft, yCursor, pRight, yCursor + pillH);
 
-                    int pColor = ev.color;
-                    if (!inMonth) {
-                        pColor = (pColor & 0x00FFFFFF) | 0xB8000000;
-                    }
+                    int pColor = isPast
+                            ? AppTheme.pastPillColor(ev.color, palette)
+                            : AppTheme.normalizePillColor(ev.color);
                     pillPaint.setColor(pColor);
                     canvas.drawRoundRect(tmpRect, dp(3.6f), dp(3.6f), pillPaint);
 
                     float textAvailW = (pRight - pLeft) - dp(5f);
                     if (textAvailW > dp(6f)) {
-                        pillTextPaint.setColor(AppTheme.textColorOnPill(ev.color));
+                        pillTextPaint.setColor(isPast
+                                ? AppTheme.pastTextColorOnPill(ev.color)
+                                : AppTheme.textColorOnPill(ev.color));
                         CharSequence ellip = TextUtils.ellipsize(
                                 ev.title, pillTextPaint, textAvailW, TextUtils.TruncateAt.END);
                         Paint.FontMetrics fm = pillTextPaint.getFontMetrics();
@@ -334,7 +340,7 @@ public final class MonthCalendarView extends View {
 
                 if (hasOverflow) {
                     int remaining = dayEvents.size() - renderCount;
-                    pillTextPaint.setColor(palette.textPrimary);
+                    pillTextPaint.setColor(isPast ? palette.textDim : palette.textPrimary);
                     String dots = "••• +" + remaining;
                     canvas.drawText(dots, left + dp(4f), yCursor + dp(10.5f), pillTextPaint);
                 }
