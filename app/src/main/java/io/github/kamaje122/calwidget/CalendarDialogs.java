@@ -22,9 +22,12 @@ import android.content.ActivityNotFoundException;
 import android.content.ContentUris;
 import android.content.Context;
 import android.content.Intent;
+import android.database.ContentObserver;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.CalendarContract;
 import android.text.Editable;
 import android.text.SpannableString;
@@ -320,6 +323,39 @@ public final class CalendarDialogs {
 
         applyHeader.run();
         applyData.accept(dayEvents != null ? dayEvents : new ArrayList<>());
+        reload[0].run();
+
+        final Handler uiHandler = new Handler(Looper.getMainLooper());
+        final Runnable delayedDayReload = () -> {
+            if (dialog.isShowing() && !activity.isFinishing()) {
+                reload[0].run();
+            }
+        };
+        final ContentObserver dayObserver = new ContentObserver(uiHandler) {
+            @Override
+            public void onChange(boolean selfChange, Uri uri) {
+                uiHandler.removeCallbacks(delayedDayReload);
+                uiHandler.postDelayed(delayedDayReload, 120L);
+            }
+        };
+        final boolean[] obsRegistered = {false};
+        if (CalendarDataRepository.hasReadPermission(activity)) {
+            try {
+                activity.getContentResolver().registerContentObserver(
+                        CalendarContract.CONTENT_URI, true, dayObserver);
+                obsRegistered[0] = true;
+            } catch (RuntimeException ignored) {
+            }
+        }
+        dialog.setOnDismissListener(d -> {
+            uiHandler.removeCallbacks(delayedDayReload);
+            if (obsRegistered[0]) {
+                try {
+                    activity.getContentResolver().unregisterContentObserver(dayObserver);
+                } catch (RuntimeException ignored) {
+                }
+            }
+        });
 
         dialog.setContentView(card);
         dialog.show();

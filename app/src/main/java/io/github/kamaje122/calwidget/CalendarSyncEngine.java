@@ -6,10 +6,12 @@ import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
 import android.content.ContentResolver;
 import android.content.ContentUris;
+import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SyncAdapterType;
 import android.content.SyncRequest;
+import android.content.SyncStatusObserver;
 import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.graphics.Typeface;
@@ -51,11 +53,11 @@ import java.util.concurrent.Executors;
  *    and `SYNC_EXTRAS_OVERRIDE_TOO_MANY_DELETIONS = true` (prevents Google's 5-delete threshold freeze).
  * 2. Live 250ms Verification Loop: Queries `CalendarContract.Events` (`DIRTY = 1`) until Google's
  *    SyncAdapter confirms HTTP 200 and clears `DIRTY` -> reports exact sub-second / 1s completion.
- * 3. Stage 2 (on `DIRTY == 0`): Immediately wakes both `CalendarContract.AUTHORITY` (pull pass) AND
- *    any secondary Google Calendar internal SyncAdapter authorities (`com.google.android.calendar`
- *    private store) so the official Google Calendar app refreshes its internal cache too.
- * 4. Blocker Detection: Detects Android Battery Saver (`PowerManager.isPowerSaveMode()`) or disabled
- *    account sync when `DIRTY > 0` stalls, offering 1-tap fixes.
+ * 3. Stage 2 (on `DIRTY == 0` & foreground resume): Immediately wakes both `CalendarContract.AUTHORITY`
+ *    (pull pass) AND any secondary Google Calendar internal SyncAdapter authorities so incoming cloud
+ *    changes and Google Calendar's private store stay synchronized in ~1 second.
+ * 4. OS SyncStatusObserver: Listens to Android SyncManager active/pending transitions to reload UI and
+ *    widgets the instant a sync finishes (bypassing AOSP CalendarProvider2's 30s broadcast delay).
  */
 public final class CalendarSyncEngine {
 
@@ -69,6 +71,9 @@ public final class CalendarSyncEngine {
 
     public interface StatusListener {
         void onSyncStateChanged(int state, String message, DirtyReport report);
+
+        default void onSyncCompleted() {
+        }
     }
 
     public static final class DirtyItem {
@@ -123,11 +128,55 @@ public final class CalendarSyncEngine {
 
     private static volatile int sWatchGeneration = 0;
     private static volatile long sMutationStartMs = 0L;
+    private static volatile long sLastResumePullMs = 0L;
     private static volatile int sCurrentState = STATE_IDLE;
     private static volatile String sCurrentMessage = "";
     private static volatile DirtyReport sLastReport = null;
+    private static volatile Object sSystemSyncObserverHandle = null;
+    private static volatile boolean sWasAnySyncActive = false;
 
     private CalendarSyncEngine() {
+    }
+
+    public static void ensureSystemSyncObserver(Context context) {
+        if (sSystemSyncObserverHandle != null || context == null) return;
+        final Context appCtx = context.getApplicationContext();
+        try {
+            int mask = ContentResolver.SYNC_OBSERVER_TYPE_ACTIVE
+                    | ContentResolver.SYNC_OBSERVER_TYPE_PENDING;
+            SyncStatusObserver obs = which -> SYNC_EXEC.execute(() -> {
+                boolean nowActive = isAnyCalendarSyncActive(appCtx);
+                boolean finished = sWasAnySyncActive && !nowActive;
+                sWasAnySyncActive = nowActive;
+                if (finished) {
+                    // Bypass AOSP CalendarProvider2's 30-second SYNC_UPDATE_BROADCAST_TIMEOUT_MILLIS!
+                    CalendarWidgetProvider.updateAll(appCtx);
+                    notifySyncCompleted();
+                }
+            });
+            sSystemSyncObserverHandle = ContentResolver.addStatusChangeListener(mask, obs);
+        } catch (RuntimeException ignored) {
+        }
+    }
+
+    private static void notifySyncCompleted() {
+        MAIN_HANDLER.post(() -> {
+            for (StatusListener l : LISTENERS) {
+                l.onSyncCompleted();
+            }
+        });
+    }
+
+    private static boolean isAnyCalendarSyncActive(Context context) {
+        for (Account acc : loadSyncedAccounts(context)) {
+            try {
+                if (ContentResolver.isSyncActive(acc, CalendarContract.AUTHORITY)) {
+                    return true;
+                }
+            } catch (RuntimeException ignored) {
+            }
+        }
+        return false;
     }
 
     public static void addListener(StatusListener listener) {
@@ -145,6 +194,7 @@ public final class CalendarSyncEngine {
     /** Called right after creating, editing, updating reminders, or deleting on a specific calendarId. */
     public static void pushCalendarImmediate(Context context, long calendarId) {
         final Context appCtx = context.getApplicationContext();
+        ensureSystemSyncObserver(appCtx);
         SYNC_EXEC.execute(() -> {
             if (calendarId > 0 && CalendarDataRepository.hasReadPermission(appCtx)) {
                 Uri calUri = ContentUris.withAppendedId(CalendarContract.Calendars.CONTENT_URI, calendarId);
@@ -171,6 +221,7 @@ public final class CalendarSyncEngine {
     /** Called right after deleting or mutating when accountName + accountType are already known. */
     public static void pushAccountImmediate(Context context, String accountName, String accountType) {
         final Context appCtx = context.getApplicationContext();
+        ensureSystemSyncObserver(appCtx);
         SYNC_EXEC.execute(() -> {
             if (!TextUtils.isEmpty(accountName) && !TextUtils.isEmpty(accountType)
                     && !CalendarContract.ACCOUNT_TYPE_LOCAL.equals(accountType)) {
@@ -182,28 +233,162 @@ public final class CalendarSyncEngine {
     }
 
     /**
-     * Self-heals any stuck `DIRTY = 1` / `DELETED = 1` changes left behind in CalendarProvider
-     * (e.g. from earlier deletions blocked by Battery Saver or TooManyDeletions).
+     * Triggered automatically on EVERY `MainActivity.onResume()` (with a 2.5s anti-bounce guard):
+     * 1. Repairs `SYNC_EVENTS = 1` / `VISIBLE = 1` on any non-hidden Google calendar (fixes Pixel
+     *    shared-calendar bug #551608026 where shared calendars default to `SYNC_EVENTS = 0`).
+     * 2. Flushes any `DIRTY = 1` local edits via Stage 1 Fast Upload.
+     * 3. ALWAYS dispatches Stage 2 Expedited Job Pull across all Google/System accounts so edits
+     *    made in Google Calendar (or by shared-calendar partners) arrive immediately!
      */
-    public static void flushStuckDirtyQueueOnStartup(Context context) {
+    public static void syncOnForegroundResume(Context context) {
         final Context appCtx = context.getApplicationContext();
+        ensureSystemSyncObserver(appCtx);
+        long now = System.currentTimeMillis();
+        if (now >= sLastResumePullMs && (now - sLastResumePullMs) < 2_500L) {
+            return;
+        }
+        sLastResumePullMs = now;
+        syncNowBidirectional(appCtx, false);
+    }
+
+    /** Immediate bidirectional cloud sync (used by foreground resume & Top-Bar / Drawer `↻` button). */
+    public static void syncNowBidirectional(Context context, boolean showPullBanner) {
+        final Context appCtx = context.getApplicationContext();
+        ensureSystemSyncObserver(appCtx);
+        sLastResumePullMs = System.currentTimeMillis();
         SYNC_EXEC.execute(() -> {
+            healSharedCalendarsSyncFlags(appCtx);
             DirtyReport report = inspectDirtyQueue(appCtx);
+            Set<Account> accounts = loadSyncedAccounts(appCtx);
             if (report.totalDirty > 0) {
                 sMutationStartMs = System.currentTimeMillis();
                 for (Account acc : report.dirtyAccounts) {
                     dispatchStage1FastUpload(acc);
                 }
-                startVerificationLoop(appCtx, new LinkedHashSet<>(report.dirtyAccounts));
-            } else if (sCurrentState == STATE_BLOCKED) {
-                emitState(STATE_IDLE, "", report);
+                for (Account acc : accounts) {
+                    if (!report.dirtyAccounts.contains(acc)) {
+                        dispatchStage2FullSyncAndWakeGoogleApp(acc);
+                    }
+                }
+                startVerificationLoop(appCtx, accounts.isEmpty() ? report.dirtyAccounts : accounts);
+                return;
+            }
+
+            if (accounts.isEmpty()) {
+                if (sCurrentState == STATE_BLOCKED) emitState(STATE_IDLE, "", report);
+                return;
+            }
+
+            long pullStart = System.currentTimeMillis();
+            for (Account acc : accounts) {
+                dispatchStage2FullSyncAndWakeGoogleApp(acc);
+            }
+            if (showPullBanner) {
+                final int gen = ++sWatchGeneration;
+                emitState(STATE_SYNCING, "🔄 正在極速同步 Google 與 Notion 最新行程…", report);
+                watchPullCompletion(appCtx, gen, pullStart, 1);
+            } else {
+                if (sCurrentState == STATE_BLOCKED) emitState(STATE_IDLE, "", report);
+                // Also run a lightweight silent completion check at +0.9s and +2.2s to guarantee UI refresh
+                scheduleSilentPostPullReload(appCtx);
             }
         });
+    }
+
+    private static void watchPullCompletion(Context appCtx, int gen, long startMs, int step) {
+        MAIN_HANDLER.postDelayed(() -> SYNC_EXEC.execute(() -> {
+            if (gen != sWatchGeneration) return;
+            boolean active = isAnyCalendarSyncActive(appCtx);
+            // Wait at least 2 steps (500ms) so SyncManager has transitioned into active state
+            if (!active && step >= 2) {
+                long elapsed = Math.max(200L, System.currentTimeMillis() - startMs);
+                String sec = String.format(Locale.US, "%.1f", elapsed / 1000.0);
+                DirtyReport rep = inspectDirtyQueue(appCtx);
+                CalendarWidgetProvider.updateAll(appCtx);
+                notifySyncCompleted();
+                emitState(STATE_SYNCED, "✓ 已同步最新雲端行程（" + sec + " 秒）", rep);
+                scheduleAutoHide(gen, 2400L);
+                return;
+            }
+            if (step < 24) {
+                watchPullCompletion(appCtx, gen, startMs, step + 1);
+            } else {
+                CalendarWidgetProvider.updateAll(appCtx);
+                notifySyncCompleted();
+                emitState(STATE_SYNCED, "✓ 已觸發背景雙向同步", sLastReport);
+                scheduleAutoHide(gen, 2000L);
+            }
+        }), 250L);
+    }
+
+    private static void scheduleSilentPostPullReload(Context appCtx) {
+        MAIN_HANDLER.postDelayed(() -> {
+            notifySyncCompleted();
+            CalendarWidgetProvider.updateAll(appCtx);
+        }, 1_100L);
+        MAIN_HANDLER.postDelayed(() -> {
+            notifySyncCompleted();
+            CalendarWidgetProvider.updateAll(appCtx);
+        }, 2_600L);
+    }
+
+    /**
+     * Fixes Pixel / Android 15–16 bug (Google Issue #551608026) where secondary/shared Google
+     * calendars are initialized with `SYNC_EVENTS = 0` or `VISIBLE = 0`, preventing CalendarProvider
+     * from syncing shared calendar updates unless enabled on `Calendars.CONTENT_URI`.
+     */
+    private static void healSharedCalendarsSyncFlags(Context appCtx) {
+        if (!CalendarDataRepository.hasReadPermission(appCtx)
+                || !CalendarDataRepository.hasWritePermission(appCtx)) {
+            return;
+        }
+        Set<String> appHidden = AppPrefs.getAppHiddenCalendars(appCtx);
+        String[] proj = {
+                CalendarContract.Calendars._ID,
+                CalendarContract.Calendars.VISIBLE,
+                CalendarContract.Calendars.SYNC_EVENTS,
+                CalendarContract.Calendars.ACCOUNT_TYPE
+        };
+        List<Long> toEnable = new ArrayList<>();
+        try (Cursor c = appCtx.getContentResolver().query(
+                CalendarContract.Calendars.CONTENT_URI, proj, null, null, null)) {
+            if (c != null) {
+                while (c.moveToNext()) {
+                    long id = c.getLong(0);
+                    if (appHidden.contains(String.valueOf(id))) continue;
+                    String type = c.getString(3);
+                    if (type == null || !type.contains("google")) continue;
+                    boolean vis = c.getInt(1) != 0;
+                    boolean sync = c.getInt(2) != 0;
+                    if (!vis || !sync) {
+                        toEnable.add(id);
+                    }
+                }
+            }
+        } catch (RuntimeException ignored) {
+        }
+        for (Long id : toEnable) {
+            try {
+                ContentValues cv = new ContentValues();
+                cv.put(CalendarContract.Calendars.VISIBLE, 1);
+                cv.put(CalendarContract.Calendars.SYNC_EVENTS, 1);
+                appCtx.getContentResolver().update(
+                        ContentUris.withAppendedId(CalendarContract.Calendars.CONTENT_URI, id),
+                        cv, null, null);
+            } catch (RuntimeException ignored) {
+            }
+        }
+    }
+
+    /** Legacy entrypoint kept for compatibility: flushes dirty queue & pulls latest changes. */
+    public static void flushStuckDirtyQueueOnStartup(Context context) {
+        syncOnForegroundResume(context);
     }
 
     /** Bidirectional expedited sync across all synced accounts (used by manual refresh & widgets). */
     public static void requestAllExpeditedPull(Context context) {
         final Context appCtx = context.getApplicationContext();
+        ensureSystemSyncObserver(appCtx);
         SYNC_EXEC.execute(() -> pushAllSyncedAccountsInternal(appCtx, false));
     }
 

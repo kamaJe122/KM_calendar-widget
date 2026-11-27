@@ -105,18 +105,32 @@ public class MainActivity extends Activity {
     private ScrollView drawerScroll;
     private LinearLayout drawerContent;
 
-    private final Runnable debouncedProviderReload = this::reloadCalendarData;
+    private final Runnable debouncedProviderReload = () -> {
+        reloadCalendarData();
+        CalendarWidgetProvider.updateAll(getApplicationContext());
+    };
 
     private final ContentObserver calendarContentObserver = new ContentObserver(mainHandler) {
         @Override
         public void onChange(boolean selfChange, Uri uri) {
             mainHandler.removeCallbacks(debouncedProviderReload);
-            mainHandler.postDelayed(debouncedProviderReload, 140L);
+            mainHandler.postDelayed(debouncedProviderReload, 120L);
         }
     };
 
     private final CalendarSyncEngine.StatusListener syncStatusListener =
-            (state, message, report) -> updateSyncStatusBanner(state, message);
+            new CalendarSyncEngine.StatusListener() {
+                @Override
+                public void onSyncStateChanged(int state, String message, CalendarSyncEngine.DirtyReport report) {
+                    updateSyncStatusBanner(state, message);
+                }
+
+                @Override
+                public void onSyncCompleted() {
+                    reloadCalendarData();
+                    rebuildDrawerContent();
+                }
+            };
 
     private final CalendarDialogs.Callbacks dialogCallbacks = new CalendarDialogs.Callbacks() {
         @Override
@@ -197,21 +211,6 @@ public class MainActivity extends Activity {
             public void onError(String message) {
             }
         });
-
-        // Trigger background Notion refresh if connected
-        if (NotionManager.hasToken(this)) {
-            NotionManager.refreshEventsOnlyAsync(this, 8_000L, new NotionManager.SyncCallback() {
-                @Override
-                public void onSuccess(String workspaceName, int sourceCount, int eventCount) {
-                    reloadCalendarData();
-                    rebuildDrawerContent();
-                }
-
-                @Override
-                public void onError(String errorMessage) {
-                }
-            });
-        }
     }
 
     @Override
@@ -232,8 +231,10 @@ public class MainActivity extends Activity {
     private void registerCalendarObserverIfPermitted() {
         if (calendarObserverRegistered || !CalendarDataRepository.hasReadPermission(this)) return;
         try {
+            // CRITICAL: AOSP CalendarProvider2.notifyChange() notifies CalendarContract.CONTENT_URI
+            // (content://com.android.calendar), NOT /events — register on root CONTENT_URI!
             getContentResolver().registerContentObserver(
-                    CalendarContract.Events.CONTENT_URI, true, calendarContentObserver);
+                    CalendarContract.CONTENT_URI, true, calendarContentObserver);
             calendarObserverRegistered = true;
         } catch (RuntimeException ignored) {
         }
@@ -268,11 +269,11 @@ public class MainActivity extends Activity {
         rebuildDrawerContent();
         reloadCalendarData();
         EventReminderManager.scheduleAsync(this);
-        // Automatically flush any stuck DIRTY=1 / DELETED=1 Google Calendar changes
-        CalendarSyncEngine.flushStuckDirtyQueueOnStartup(this);
+        // Immediately pull latest Google Calendar updates & flush any pending local changes!
+        CalendarSyncEngine.syncOnForegroundResume(this);
         // Pull fresh Notion updates within <1s when returning to the app
         if (NotionManager.hasToken(this)) {
-            NotionManager.refreshEventsOnlyAsync(this, 8_000L, new NotionManager.SyncCallback() {
+            NotionManager.refreshEventsOnlyAsync(this, 3_000L, new NotionManager.SyncCallback() {
                 @Override
                 public void onSuccess(String workspaceName, int sourceCount, int eventCount) {
                     reloadCalendarData();
@@ -379,7 +380,13 @@ public class MainActivity extends Activity {
         searchBtn.setContentDescription("搜尋行程");
         searchBtn.setOnClickListener(v -> CalendarDialogs.showSearchDialog(
                 this, AppPrefs.getAppHiddenCalendars(this), palette, dialogCallbacks));
-        topBar.addView(searchBtn, new LinearLayout.LayoutParams(dp(42), dp(42)));
+        topBar.addView(searchBtn, new LinearLayout.LayoutParams(dp(40), dp(42)));
+
+        // 1-Tap Instant Cloud Sync icon button ("↻")
+        RefreshIconView syncNowBtn = new RefreshIconView(this);
+        syncNowBtn.setContentDescription("立即雙向同步 Google 與 Notion");
+        syncNowBtn.setOnClickListener(v -> triggerManualInstantSync());
+        topBar.addView(syncNowBtn, new LinearLayout.LayoutParams(dp(40), dp(42)));
 
         // Today "[26]" icon button
         todayBadgeBtn = new TodayBadgeIconView(this, LocalDate.now().getDayOfMonth());
@@ -391,14 +398,14 @@ public class MainActivity extends Activity {
             }
             reloadCalendarData();
         });
-        topBar.addView(todayBadgeBtn, new LinearLayout.LayoutParams(dp(42), dp(42)));
+        topBar.addView(todayBadgeBtn, new LinearLayout.LayoutParams(dp(40), dp(42)));
 
         // Widget & Notion Settings button
         settingsBadgeBtn = new SettingsBadgeIconView(this);
         settingsBadgeBtn.setContentDescription("小工具、Notion 與更新設定");
         settingsBadgeBtn.setOnClickListener(v ->
                 startActivity(new Intent(this, WidgetConfigActivity.class)));
-        topBar.addView(settingsBadgeBtn, new LinearLayout.LayoutParams(dp(42), dp(42)));
+        topBar.addView(settingsBadgeBtn, new LinearLayout.LayoutParams(dp(40), dp(42)));
 
         mainRoot.addView(topBar, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
@@ -742,26 +749,7 @@ public class MainActivity extends Activity {
         refreshRow.setPadding(dp(14), dp(11), dp(14), dp(11));
         refreshRow.setOnClickListener(v -> {
             drawerLayout.closeDrawer();
-            Toast.makeText(this, "⏳ 正在重新同步 Google 與 Notion 行事曆…", Toast.LENGTH_SHORT).show();
-            CalendarWidgetProvider.requestSync(this, 0L);
-            if (NotionManager.hasToken(this)) {
-                NotionManager.refreshEventsOnlyAsync(this, 0L, new NotionManager.SyncCallback() {
-                    @Override
-                    public void onSuccess(String workspaceName, int sourceCount, int eventCount) {
-                        reloadCalendarData();
-                        rebuildDrawerContent();
-                        Toast.makeText(MainActivity.this,
-                                "✅ 已同步 Notion（" + eventCount + " 筆行程）", Toast.LENGTH_SHORT).show();
-                    }
-
-                    @Override
-                    public void onError(String errorMessage) {
-                        Toast.makeText(MainActivity.this, "⚠️ " + errorMessage, Toast.LENGTH_SHORT).show();
-                    }
-                });
-            } else {
-                reloadCalendarData();
-            }
+            triggerManualInstantSync();
         });
         TextView refIcon = new TextView(this);
         refIcon.setText("↻");
@@ -1274,6 +1262,57 @@ public class MainActivity extends Activity {
             canvas.drawLine(cx - hw, cy - 5.5f * d, cx + hw, cy - 5.5f * d, p);
             canvas.drawLine(cx - hw, cy, cx + hw, cy, p);
             canvas.drawLine(cx - hw, cy + 5.5f * d, cx + hw, cy + 5.5f * d, p);
+        }
+    }
+
+    private void triggerManualInstantSync() {
+        CalendarSyncEngine.enableAllAutoSyncSettings(this);
+        CalendarSyncEngine.syncNowBidirectional(this, true);
+        if (NotionManager.hasToken(this)) {
+            NotionManager.refreshEventsOnlyAsync(this, 0L, new NotionManager.SyncCallback() {
+                @Override
+                public void onSuccess(String workspaceName, int sourceCount, int eventCount) {
+                    reloadCalendarData();
+                    rebuildDrawerContent();
+                }
+
+                @Override
+                public void onError(String errorMessage) {
+                    Toast.makeText(MainActivity.this, "⚠️ " + errorMessage, Toast.LENGTH_SHORT).show();
+                }
+            });
+        } else {
+            reloadCalendarData();
+        }
+    }
+
+    private final class RefreshIconView extends View {
+        private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF arcBox = new RectF();
+
+        RefreshIconView(MainActivity ctx) {
+            super(ctx);
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeCap(Paint.Cap.ROUND);
+            p.setStrokeJoin(Paint.Join.ROUND);
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            float d = getResources().getDisplayMetrics().density;
+            p.setColor(palette.textPrimary);
+            p.setStrokeWidth(2.0f * d);
+            float cx = getWidth() * 0.5f;
+            float cy = getHeight() * 0.5f;
+            float r = 7.8f * d;
+            arcBox.set(cx - r, cy - r, cx + r, cy + r);
+            canvas.drawArc(arcBox, 35f, 295f, false, p);
+            // Crisp arrowhead at ~330 deg (upper-right)
+            double rad = Math.toRadians(330.0);
+            float tipX = cx + (float) (r * Math.cos(rad));
+            float tipY = cy + (float) (r * Math.sin(rad));
+            canvas.drawLine(tipX, tipY, tipX - 4.2f * d, tipY - 1.2f * d, p);
+            canvas.drawLine(tipX, tipY, tipX + 0.6f * d, tipY - 4.3f * d, p);
         }
     }
 
