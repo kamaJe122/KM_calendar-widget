@@ -377,32 +377,7 @@ public class CalendarWidgetProvider extends AppWidgetProvider {
             return;
         }
         prefs(context).edit().putLong(KEY_LAST_SYNC, now).apply();
-
-        Set<String> seen = new HashSet<>();
-        String[] proj = new String[]{
-                CalendarContract.Calendars.ACCOUNT_NAME,
-                CalendarContract.Calendars.ACCOUNT_TYPE
-        };
-        try (Cursor c = context.getContentResolver().query(
-                CalendarContract.Calendars.CONTENT_URI,
-                proj,
-                CalendarContract.Calendars.SYNC_EVENTS + " = 1",
-                null,
-                null)) {
-            if (c != null) {
-                while (c.moveToNext()) {
-                    String name = c.getString(0);
-                    String type = c.getString(1);
-                    if (TextUtils.isEmpty(name) || TextUtils.isEmpty(type)) continue;
-                    if (!seen.add(type + "/" + name)) continue;
-                    Bundle extras = new Bundle();
-                    extras.putBoolean(ContentResolver.SYNC_EXTRAS_MANUAL, true);
-                    extras.putBoolean(ContentResolver.SYNC_EXTRAS_EXPEDITED, true);
-                    ContentResolver.requestSync(new Account(name, type), CalendarContract.AUTHORITY, extras);
-                }
-            }
-        } catch (RuntimeException ignored) {
-        }
+        CalendarSyncEngine.requestAllExpeditedPull(context);
     }
 
     static int daysToShow(Context context, int profileId) {

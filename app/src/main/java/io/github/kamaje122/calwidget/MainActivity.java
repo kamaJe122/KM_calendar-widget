@@ -8,16 +8,19 @@ import android.appwidget.AppWidgetManager;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
+import android.database.ContentObserver;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.CalendarContract;
 import android.provider.Settings;
 import android.text.SpannableString;
 import android.text.Spanned;
@@ -72,6 +75,7 @@ public class MainActivity extends Activity {
     private final ExecutorService dataExecutor = Executors.newSingleThreadExecutor();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private int loadGeneration = 0;
+    private boolean calendarObserverRegistered = false;
 
     private AppTheme.Palette palette;
     private int viewMode;
@@ -86,6 +90,8 @@ public class MainActivity extends Activity {
     private TextView topLunarSubtitle;
     private TodayBadgeIconView todayBadgeBtn;
     private SettingsBadgeIconView settingsBadgeBtn;
+    private LinearLayout syncStatusStrip;
+    private TextView syncStatusLabel;
     private LinearLayout permissionBanner;
     private FrameLayout viewportFrame;
     private View fabPlus;
@@ -98,6 +104,19 @@ public class MainActivity extends Activity {
     // Drawer Views
     private ScrollView drawerScroll;
     private LinearLayout drawerContent;
+
+    private final Runnable debouncedProviderReload = this::reloadCalendarData;
+
+    private final ContentObserver calendarContentObserver = new ContentObserver(mainHandler) {
+        @Override
+        public void onChange(boolean selfChange, Uri uri) {
+            mainHandler.removeCallbacks(debouncedProviderReload);
+            mainHandler.postDelayed(debouncedProviderReload, 140L);
+        }
+    };
+
+    private final CalendarSyncEngine.StatusListener syncStatusListener =
+            (state, message, report) -> updateSyncStatusBanner(state, message);
 
     private final CalendarDialogs.Callbacks dialogCallbacks = new CalendarDialogs.Callbacks() {
         @Override
@@ -181,7 +200,7 @@ public class MainActivity extends Activity {
 
         // Trigger background Notion refresh if connected
         if (NotionManager.hasToken(this)) {
-            NotionManager.refreshEventsOnlyAsync(this, 45_000L, new NotionManager.SyncCallback() {
+            NotionManager.refreshEventsOnlyAsync(this, 8_000L, new NotionManager.SyncCallback() {
                 @Override
                 public void onSuccess(String workspaceName, int sourceCount, int eventCount) {
                     reloadCalendarData();
@@ -193,6 +212,40 @@ public class MainActivity extends Activity {
                 }
             });
         }
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        CalendarSyncEngine.addListener(syncStatusListener);
+        registerCalendarObserverIfPermitted();
+    }
+
+    @Override
+    protected void onStop() {
+        CalendarSyncEngine.removeListener(syncStatusListener);
+        unregisterCalendarObserver();
+        mainHandler.removeCallbacks(debouncedProviderReload);
+        super.onStop();
+    }
+
+    private void registerCalendarObserverIfPermitted() {
+        if (calendarObserverRegistered || !CalendarDataRepository.hasReadPermission(this)) return;
+        try {
+            getContentResolver().registerContentObserver(
+                    CalendarContract.Events.CONTENT_URI, true, calendarContentObserver);
+            calendarObserverRegistered = true;
+        } catch (RuntimeException ignored) {
+        }
+    }
+
+    private void unregisterCalendarObserver() {
+        if (!calendarObserverRegistered) return;
+        try {
+            getContentResolver().unregisterContentObserver(calendarContentObserver);
+        } catch (RuntimeException ignored) {
+        }
+        calendarObserverRegistered = false;
     }
 
     @Override
@@ -210,10 +263,27 @@ public class MainActivity extends Activity {
         if (todayBadgeBtn != null) {
             todayBadgeBtn.setDayNumber(LocalDate.now().getDayOfMonth());
         }
+        registerCalendarObserverIfPermitted();
         applyThemeToShell();
         rebuildDrawerContent();
         reloadCalendarData();
         EventReminderManager.scheduleAsync(this);
+        // Automatically flush any stuck DIRTY=1 / DELETED=1 Google Calendar changes
+        CalendarSyncEngine.flushStuckDirtyQueueOnStartup(this);
+        // Pull fresh Notion updates within <1s when returning to the app
+        if (NotionManager.hasToken(this)) {
+            NotionManager.refreshEventsOnlyAsync(this, 8_000L, new NotionManager.SyncCallback() {
+                @Override
+                public void onSuccess(String workspaceName, int sourceCount, int eventCount) {
+                    reloadCalendarData();
+                    rebuildDrawerContent();
+                }
+
+                @Override
+                public void onError(String errorMessage) {
+                }
+            });
+        }
     }
 
     @Override
@@ -228,6 +298,7 @@ public class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        registerCalendarObserverIfPermitted();
         CalendarWidgetProvider.updateAll(this);
         EventReminderManager.scheduleAsync(this);
         if (requestCode == REQ_POST_NOTIF_PREVIEW && EventReminderManager.canPostNotifications(this)) {
@@ -330,6 +401,23 @@ public class MainActivity extends Activity {
         topBar.addView(settingsBadgeBtn, new LinearLayout.LayoutParams(dp(42), dp(42)));
 
         mainRoot.addView(topBar, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        // 1B. Live Cloud Sync Verification & Battery-Saver Warning Strip
+        syncStatusStrip = new LinearLayout(this);
+        syncStatusStrip.setOrientation(LinearLayout.HORIZONTAL);
+        syncStatusStrip.setGravity(Gravity.CENTER_VERTICAL);
+        syncStatusStrip.setPadding(dp(14), dp(6), dp(14), dp(6));
+        syncStatusStrip.setVisibility(View.GONE);
+        syncStatusStrip.setOnClickListener(v ->
+                CalendarSyncEngine.showSyncDiagnosticsDialog(this, palette));
+
+        syncStatusLabel = new TextView(this);
+        syncStatusLabel.setTextSize(12.2f);
+        syncStatusLabel.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+        syncStatusStrip.addView(syncStatusLabel, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        mainRoot.addView(syncStatusStrip, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         // 2. Optional Permission Onboarding Strip
@@ -491,6 +579,26 @@ public class MainActivity extends Activity {
                 }
             }
         }
+    }
+
+    private void updateSyncStatusBanner(int state, String message) {
+        if (syncStatusStrip == null || syncStatusLabel == null || isFinishing()) return;
+        if (state == CalendarSyncEngine.STATE_IDLE || TextUtils.isEmpty(message)) {
+            syncStatusStrip.setVisibility(View.GONE);
+            return;
+        }
+        syncStatusLabel.setText(message);
+        if (state == CalendarSyncEngine.STATE_SYNCING) {
+            syncStatusStrip.setBackgroundColor(palette.isDark ? 0xFF1A273B : 0xFFE8F0FE);
+            syncStatusLabel.setTextColor(palette.isDark ? 0xFF8AB4F8 : 0xFF1967D2);
+        } else if (state == CalendarSyncEngine.STATE_SYNCED) {
+            syncStatusStrip.setBackgroundColor(palette.isDark ? 0xFF162B20 : 0xFFE6F4EA);
+            syncStatusLabel.setTextColor(palette.isDark ? 0xFF81C995 : 0xFF137333);
+        } else {
+            syncStatusStrip.setBackgroundColor(palette.isDark ? 0xFF3A2410 : 0xFFFEF7E0);
+            syncStatusLabel.setTextColor(palette.isDark ? 0xFFFDD663 : 0xFFB06000);
+        }
+        syncStatusStrip.setVisibility(View.VISIBLE);
     }
 
     private void reloadCalendarData() {
@@ -670,6 +778,29 @@ public class MainActivity extends Activity {
         refLabel.setTextColor(palette.textPrimary);
         refreshRow.addView(refLabel);
         drawerContent.addView(refreshRow);
+
+        // 3B. Real-Time Cloud Sync Diagnostics & 1-Second Optimization Row
+        LinearLayout syncDiagRow = new LinearLayout(this);
+        syncDiagRow.setOrientation(LinearLayout.HORIZONTAL);
+        syncDiagRow.setGravity(Gravity.CENTER_VERTICAL);
+        syncDiagRow.setPadding(dp(14), dp(10), dp(14), dp(10));
+        syncDiagRow.setOnClickListener(v -> {
+            drawerLayout.closeDrawer();
+            CalendarSyncEngine.showSyncDiagnosticsDialog(this, palette);
+        });
+        TextView sdIcon = new TextView(this);
+        sdIcon.setText("⚡");
+        sdIcon.setTextSize(16.5f);
+        sdIcon.setWidth(dp(34));
+        syncDiagRow.addView(sdIcon);
+
+        TextView sdLabel = new TextView(this);
+        sdLabel.setText("雲端同步診斷 · 1 秒極速設定");
+        sdLabel.setTextSize(14.5f);
+        sdLabel.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
+        sdLabel.setTextColor(palette.selectedStroke);
+        syncDiagRow.addView(sdLabel);
+        drawerContent.addView(syncDiagRow);
 
         // 4. Widget & Notion Settings Entry Card
         LinearLayout widgetBtn = new LinearLayout(this);

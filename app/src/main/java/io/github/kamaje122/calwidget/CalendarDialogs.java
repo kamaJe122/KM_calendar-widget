@@ -1280,8 +1280,9 @@ public final class CalendarDialogs {
 
     private static void afterSystemDelete(Activity activity, Dialog dialog, Callbacks callbacks, boolean ok) {
         if (ok) {
+            EventReminderManager.scheduleAsync(activity);
             dialog.dismiss();
-            Toast.makeText(activity, "✅ 已刪除並同步回來源日曆", Toast.LENGTH_SHORT).show();
+            Toast.makeText(activity, "✅ 已刪除並啟動秒速雲端同步", Toast.LENGTH_SHORT).show();
             callbacks.onEventsMutated();
         } else {
             Toast.makeText(activity, "刪除失敗，此日曆可能為唯讀", Toast.LENGTH_SHORT).show();
