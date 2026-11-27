@@ -156,8 +156,11 @@ public final class CalendarDialogs {
         titleCol.addView(titleTv);
         titleCol.addView(lunarTv);
 
-        TextView zoomOut = makeChipButton(activity, "−", palette.textPrimary, palette.chipBg, 20f);
-        TextView zoomIn = makeChipButton(activity, "＋", palette.textPrimary, palette.chipBg, 17f);
+        TextView zoomFit = makeChipButton(activity, "00–24", palette.textSecondary, palette.chipBg, 11.5f);
+        zoomFit.setPadding(dp(activity, 8), 0, dp(activity, 8), 0);
+        zoomFit.setContentDescription("顯示完整 00–24 點");
+        TextView zoomOut = makeChipButton(activity, "−", palette.textPrimary, palette.chipBg, 19f);
+        TextView zoomIn = makeChipButton(activity, "＋", palette.textPrimary, palette.chipBg, 16.5f);
         zoomOut.setContentDescription("縮小時間軸");
         zoomIn.setContentDescription("放大時間軸");
         TextView closeBtn = makeIconButton(activity, "✕", palette.textSecondary, 19f);
@@ -165,11 +168,15 @@ public final class CalendarDialogs {
         header.addView(prevBtn);
         header.addView(titleCol, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         header.addView(nextBtn);
-        LinearLayout.LayoutParams zLp = new LinearLayout.LayoutParams(dp(activity, 38), dp(activity, 34));
-        zLp.setMarginStart(dp(activity, 6));
+        LinearLayout.LayoutParams zFitLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(activity, 32));
+        zFitLp.setMarginStart(dp(activity, 2));
+        header.addView(zoomFit, zFitLp);
+        LinearLayout.LayoutParams zLp = new LinearLayout.LayoutParams(dp(activity, 34), dp(activity, 32));
+        zLp.setMarginStart(dp(activity, 4));
         header.addView(zoomOut, zLp);
-        LinearLayout.LayoutParams zLp2 = new LinearLayout.LayoutParams(dp(activity, 38), dp(activity, 34));
-        zLp2.setMarginStart(dp(activity, 6));
+        LinearLayout.LayoutParams zLp2 = new LinearLayout.LayoutParams(dp(activity, 34), dp(activity, 32));
+        zLp2.setMarginStart(dp(activity, 4));
         header.addView(zoomIn, zLp2);
         header.addView(closeBtn);
         card.addView(header);
@@ -301,8 +308,9 @@ public final class CalendarDialogs {
             current[0] = LocalDate.of(y, m + 1, dd);
             reload[0].run();
         }, current[0].getYear(), current[0].getMonthValue() - 1, current[0].getDayOfMonth()).show());
-        zoomOut.setOnClickListener(v -> timeline.zoomBy(0.8f));
-        zoomIn.setOnClickListener(v -> timeline.zoomBy(1.25f));
+        zoomFit.setOnClickListener(v -> timeline.resetToFullDay());
+        zoomOut.setOnClickListener(v -> timeline.zoomBy(0.78f));
+        zoomIn.setOnClickListener(v -> timeline.zoomBy(1.28f));
         closeBtn.setOnClickListener(v -> dialog.dismiss());
         fullBtn.setOnClickListener(v -> {
             dialog.dismiss();

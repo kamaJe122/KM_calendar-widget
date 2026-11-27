@@ -76,6 +76,7 @@ public final class MultiDayTimelineView extends View {
         final float startMin;
         final float endMin;
         int subCol;
+        int spanSubCols = 1;
         int totalSubCols;
         final RectF hitRect = new RectF();
         final RectF editHitRect = new RectF();
@@ -222,23 +223,51 @@ public final class MultiDayTimelineView extends View {
     }
 
     private void applyZoom(float factor, float focusY) {
-        float oldHourPx = dp(hourHeightDp);
-        hourHeightDp = Math.max(30f, Math.min(140f, hourHeightDp * factor));
-        float newHourPx = dp(hourHeightDp);
-        if (oldHourPx > 0f) {
-            float focusInView = focusY - getPinnedHeaderHeight();
-            float focusInTimeline = focusInView + scrollYOffset;
-            float ratio = newHourPx / oldHourPx;
-            scrollYOffset = clampScroll(focusInTimeline * ratio - focusInView);
+        float minHourPx = getFitHourPx();
+        float maxHourPx = dp(140f);
+        float oldHourPx = getEffectiveHourPx();
+        float newHourPx = Math.max(minHourPx, Math.min(maxHourPx, oldHourPx * factor));
+
+        if (newHourPx <= minHourPx + 0.5f) {
+            hourHeightDp = -1f;
+            scrollYOffset = 0f;
+        } else {
+            float density = getResources().getDisplayMetrics().density;
+            hourHeightDp = newHourPx / Math.max(0.5f, density);
+            if (oldHourPx > 0f) {
+                float focusInView = Math.max(0f, focusY - getPinnedHeaderHeight());
+                float focusInTimeline = focusInView + Math.max(0f, scrollYOffset);
+                float ratio = newHourPx / oldHourPx;
+                scrollYOffset = clampScroll(focusInTimeline * ratio - focusInView);
+            }
         }
-        AppPrefs.setHourHeightDp(getContext(), hourHeightDp);
+        if (!floatingMode) {
+            AppPrefs.setHourHeightDp(getContext(), hourHeightDp);
+        }
         invalidate();
     }
 
     /** Zoom the hour height around the viewport centre (used by −/＋ buttons). */
     public void zoomBy(float factor) {
-        float centreY = getPinnedHeaderHeight() + (getHeight() - getPinnedHeaderHeight()) * 0.5f;
+        float centreY = getPinnedHeaderHeight() + getViewportHeight() * 0.5f;
         applyZoom(factor, centreY);
+    }
+
+    /** Snaps immediately to full 00:00–24:00 overview filling the entire viewport cleanly. */
+    public void resetToFullDay() {
+        if (!scroller.isFinished()) {
+            scroller.abortAnimation();
+        }
+        hourHeightDp = -1f;
+        scrollYOffset = 0f;
+        if (!floatingMode) {
+            AppPrefs.setHourHeightDp(getContext(), -1f);
+        }
+        invalidate();
+    }
+
+    public boolean isFullDayFit() {
+        return hourHeightDp <= 0f;
     }
 
     public void setShowPencilBadges(boolean show) {
@@ -248,6 +277,11 @@ public final class MultiDayTimelineView extends View {
 
     public void setFloatingMode(boolean floating) {
         this.floatingMode = floating;
+        if (floating) {
+            // Floating single-day popup always opens cleanly in full 00:00–24:00 view
+            this.hourHeightDp = -1f;
+            this.scrollYOffset = 0f;
+        }
     }
 
     public void setListener(Listener listener) {
@@ -264,19 +298,29 @@ public final class MultiDayTimelineView extends View {
         this.palette = themePalette;
         this.events = rangeEvents != null ? rangeEvents : Collections.emptyList();
         rebuildEventGeometry();
-        if (scrollYOffset < 0f) {
-            scrollToDefaultHour();
-        } else {
+        if (scrollYOffset < 0f || isFullDayFit()) {
+            scrollYOffset = 0f;
+        } else if (getHeight() > 0) {
             scrollYOffset = clampScroll(scrollYOffset);
         }
         invalidate();
     }
 
     public void scrollToDefaultHour() {
-        int nowHour = LocalTime.now().getHour();
-        int targetHour = Math.max(7, Math.min(18, nowHour - 2));
-        scrollYOffset = dp(hourHeightDp) * targetHour;
+        if (isFullDayFit()) {
+            scrollYOffset = 0f;
+        } else {
+            scrollYOffset = clampScroll(0f);
+        }
         invalidate();
+    }
+
+    @Override
+    protected void onSizeChanged(int w, int h, int oldw, int oldh) {
+        super.onSizeChanged(w, h, oldw, oldh);
+        if (h > 0) {
+            scrollYOffset = isFullDayFit() ? 0f : clampScroll(Math.max(0f, scrollYOffset));
+        }
     }
 
     @Override
@@ -335,22 +379,49 @@ public final class MultiDayTimelineView extends View {
     }
 
     private void scrollByVertical(float dy) {
+        if (isFullDayFit()) return;
         scrollYOffset = clampScroll(scrollYOffset + dy);
         invalidate();
     }
 
+    private float getViewportHeight() {
+        return Math.max(1f, getHeight() - getPinnedHeaderHeight());
+    }
+
+    /** Exact pixel height per hour so 00:00–24:00 fills 100% of the viewport with zero dead space. */
+    private float getFitHourPx() {
+        if (getHeight() <= 0) return dp(25f);
+        return Math.max(dp(16f), getViewportHeight() / 24f);
+    }
+
+    private float getEffectiveHourPx() {
+        float fitPx = getFitHourPx();
+        if (hourHeightDp <= 0f) {
+            return fitPx;
+        }
+        return Math.max(fitPx, dp(hourHeightDp));
+    }
+
     private int getMaxVerticalScroll() {
-        float contentH = dp(hourHeightDp) * 24f + dp(28f);
-        float viewportH = Math.max(1f, getHeight() - getPinnedHeaderHeight());
-        return Math.max(0, Math.round(contentH - viewportH));
+        if (getHeight() <= 0 || isFullDayFit()) return 0;
+        float contentH = getEffectiveHourPx() * 24f;
+        return Math.max(0, Math.round(contentH - getViewportHeight()));
     }
 
     private float clampScroll(float raw) {
         return Math.max(0f, Math.min(getMaxVerticalScroll(), raw));
     }
 
+    private float getGutterWidth() {
+        return dp(46f);
+    }
+
+    private float getRightPadding() {
+        return floatingMode ? dp(10f) : dp(3f);
+    }
+
     private float getDayHeaderHeight() {
-        return compactDayHeader ? dp(6f) : dp(52f);
+        return compactDayHeader ? dp(4f) : dp(52f);
     }
 
     /** Hide the weekday/date header row (used by the floating single-day popup, which has its own). */
@@ -497,11 +568,27 @@ public final class MultiDayTimelineView extends View {
         int total = Math.max(1, colEnds.size());
         for (TimedBlock b : cluster) {
             b.totalSubCols = total;
+            int span = 1;
+            for (int nextCol = b.subCol + 1; nextCol < total; nextCol++) {
+                boolean blocked = false;
+                for (TimedBlock other : cluster) {
+                    if (other.subCol == nextCol
+                            && other.startMin < b.endMin - 0.5f
+                            && other.endMin > b.startMin + 0.5f) {
+                        blocked = true;
+                        break;
+                    }
+                }
+                if (blocked) break;
+                span++;
+            }
+            b.spanSubCols = span;
         }
     }
 
     private void handleSingleTap(float x, float y) {
-        float gutterW = dp(48f);
+        float gutterW = getGutterWidth();
+        float rightPad = getRightPadding();
         float dayHeaderH = getDayHeaderHeight();
         float pinnedH = getPinnedHeaderHeight();
 
@@ -531,8 +618,8 @@ public final class MultiDayTimelineView extends View {
             return;
         }
 
-        if (x < gutterW) return;
-        float colW = (getWidth() - gutterW) / columnCount;
+        if (x < gutterW || x > getWidth() - rightPad) return;
+        float colW = Math.max(1f, (getWidth() - gutterW - rightPad) / columnCount);
         int col = Math.min(columnCount - 1, Math.max(0, (int) ((x - gutterW) / colW)));
         LocalDate date = startDate.plusDays(col);
 
@@ -560,7 +647,7 @@ public final class MultiDayTimelineView extends View {
 
         // 4. Empty hour slot tap -> quick add event at that hour
         float timelineY = (y - pinnedH) + scrollYOffset;
-        int hour = Math.max(0, Math.min(23, (int) (timelineY / dp(hourHeightDp))));
+        int hour = Math.max(0, Math.min(23, (int) (timelineY / getEffectiveHourPx())));
         if (listener != null) {
             listener.onEmptySlotClicked(date, hour);
         }
@@ -576,26 +663,29 @@ public final class MultiDayTimelineView extends View {
         bgPaint.setColor(palette.bgCanvas);
         canvas.drawRect(0, 0, w, h, bgPaint);
 
-        float gutterW = dp(48f);
-        float colW = (w - gutterW) / columnCount;
+        float gutterW = getGutterWidth();
+        float rightPad = getRightPadding();
+        float colW = Math.max(1f, (w - gutterW - rightPad) / columnCount);
         float dayHeaderH = getDayHeaderHeight();
         float pinnedH = getPinnedHeaderHeight();
-        float hourPx = dp(hourHeightDp);
+        float viewportH = Math.max(1f, h - pinnedH);
+        float hourPx = getEffectiveHourPx();
+        scrollYOffset = isFullDayFit() ? 0f : clampScroll(Math.max(0f, scrollYOffset));
         LocalDate today = LocalDate.now();
 
-        // ================= 1. SCROLLABLE 24-HOUR TIMELINE =================
+        // ================= 1. SCROLLABLE 24-HOUR TIMELINE (00:00 – 24:00) =================
         canvas.save();
         canvas.clipRect(0, pinnedH, w, h);
         canvas.translate(dragX, pinnedH - scrollYOffset);
 
         slotPaint.setColor(palette.bgCell);
-        float slotGap = dp(1.4f);
+        float slotGap = hourPx < dp(29f) ? dp(1.0f) : dp(1.4f);
         float slotRadius = dp(5f);
 
         for (int hr = 0; hr < 24; hr++) {
             float top = hr * hourPx;
             float bottom = top + hourPx;
-            if (bottom < scrollYOffset - hourPx || top > scrollYOffset + (h - pinnedH) + hourPx) {
+            if (bottom < scrollYOffset - hourPx || top > scrollYOffset + viewportH + hourPx) {
                 continue;
             }
             for (int c = 0; c < columnCount; c++) {
@@ -605,18 +695,32 @@ public final class MultiDayTimelineView extends View {
             }
         }
 
-        // Left gutter hour labels (01:00 .. 23:00)
-        timeGutterPaint.setTextSize(sp(10.8f));
+        // Left gutter hour labels (00:00 .. 24:00) — never sliced at top/bottom clip edges
+        timeGutterPaint.setTextSize(hourPx < dp(29f) ? sp(9.6f) : sp(10.6f));
         timeGutterPaint.setColor(palette.textSecondary);
-        for (int hr = 1; hr < 24; hr++) {
-            float y = hr * hourPx;
-            if (y < scrollYOffset - dp(20) || y > scrollYOffset + (h - pinnedH) + dp(20)) continue;
+        Paint.FontMetrics gFm = timeGutterPaint.getFontMetrics();
+        float labelHalfH = (-gFm.ascent - gFm.descent) * 0.5f;
+        for (int hr = 0; hr <= 24; hr++) {
+            float baseline;
+            if (hr == 0) {
+                baseline = -gFm.ascent + dp(2f);
+            } else if (hr == 24) {
+                baseline = 24f * hourPx - gFm.descent - dp(1.5f);
+            } else {
+                baseline = hr * hourPx + labelHalfH;
+            }
+            // Skip if baseline would be clipped in half at the top or bottom viewport boundary
+            if (baseline + gFm.ascent < scrollYOffset - dp(1f)
+                    || baseline + gFm.descent > scrollYOffset + viewportH + dp(1f)) {
+                continue;
+            }
             canvas.drawText(String.format(Locale.US, "%02d:00", hr),
-                    gutterW - dp(7f), y + dp(4f), timeGutterPaint);
+                    gutterW - dp(6f), baseline, timeGutterPaint);
         }
 
         // Timed Event Blocks
-        eventTitlePaint.setTextSize(sp(columnCount >= 7 ? 10.5f : 12f));
+        boolean compactZoom = hourPx < dp(30f);
+        eventTitlePaint.setTextSize(sp(columnCount >= 7 ? 10.2f : (compactZoom ? 11.2f : 12f)));
         eventSubPaint.setTextSize(sp(columnCount >= 7 ? 9.5f : 11f));
 
         for (TimedBlock b : timedBlocks) {
@@ -625,67 +729,83 @@ public final class MultiDayTimelineView extends View {
             float subW = usableColW / b.totalSubCols;
 
             float left = colLeft + b.subCol * subW + dp(0.6f);
-            float right = left + subW - dp(1.2f);
+            float right = left + subW * b.spanSubCols - dp(1.2f);
             float top = (b.startMin / 60f) * hourPx + dp(0.8f);
-            float bottom = Math.max(top + dp(20f), (b.endMin / 60f) * hourPx - dp(0.8f));
+            float minBlockH = Math.min(dp(19f), hourPx * 0.85f);
+            float bottom = Math.min(24f * hourPx - dp(0.8f),
+                    Math.max(top + minBlockH, (b.endMin / 60f) * hourPx - dp(0.8f)));
 
             // Save screen-space hit rect for tap detection
             b.hitRect.set(left + dragX, top + pinnedH - scrollYOffset,
                     right + dragX, bottom + pinnedH - scrollYOffset);
             b.editHitRect.setEmpty();
 
-            if (bottom < scrollYOffset - dp(20) || top > scrollYOffset + (h - pinnedH) + dp(20)) {
+            if (bottom < scrollYOffset - dp(20) || top > scrollYOffset + viewportH + dp(20)) {
                 continue;
             }
 
             tmpRect.set(left, top, right, bottom);
             pillPaint.setColor(b.event.color);
-            canvas.drawRoundRect(tmpRect, dp(6f), dp(6f), pillPaint);
+            canvas.drawRoundRect(tmpRect, dp(5.5f), dp(5.5f), pillPaint);
 
             // Keep title & pencil badge visible when the top of a multi-hour block is scrolled above the header
             float contentTop = (top < scrollYOffset)
-                    ? Math.min(Math.max(top, bottom - dp(26f)), scrollYOffset + dp(2f))
+                    ? Math.min(Math.max(top, bottom - dp(24f)), scrollYOffset + dp(2f))
                     : top;
+            float visibleH = bottom - contentTop;
 
-            boolean badge = showPencilBadges && (right - left) >= dp(56f) && (bottom - contentTop) >= dp(22f);
+            boolean badge = showPencilBadges && (right - left) >= dp(54f) && visibleH >= dp(16f);
+            float badgeReserve = 0f;
             if (badge) {
-                float r = dp(10f);
-                float cx = right - dp(3f) - r;
-                float cy = contentTop + dp(2.5f) + r;
-                drawPencilBadge(canvas, cx, cy, r, 1f, b.event.color);
+                float r = Math.min(dp(9.6f), Math.max(dp(7.2f), visibleH * 0.36f));
+                float cx = right - dp(2.8f) - r;
+                float cy = visibleH < dp(28f)
+                        ? (contentTop + visibleH * 0.5f)
+                        : (contentTop + dp(2.5f) + r);
+                drawPencilBadge(canvas, cx, cy, r, r / dp(10f), b.event.color);
                 float half = dp(18f);
                 b.editHitRect.set(cx - half + dragX, cy - half + pinnedH - scrollYOffset,
                         Math.min(right, cx + half) + dragX, cy + half + pinnedH - scrollYOffset);
+                badgeReserve = r * 2f + dp(4f);
             }
 
-            int textW = (int) ((right - left) - dp(7f) - (badge ? dp(22f) : 0f));
-            int boxH = (int) ((bottom - contentTop) - dp(5f));
-            if (textW > dp(8f) && boxH > dp(10f)) {
+            int textW = (int) ((right - left) - dp(7f) - badgeReserve);
+            if (textW > dp(8f) && visibleH >= dp(12f)) {
                 eventTitlePaint.setColor(AppTheme.textColorOnPill(b.event.color));
-                String body = b.event.title;
-                if (columnCount == 1 && boxH > dp(30f)) {
-                    body = b.event.title + "\n" + b.event.formatTimeRange(zoneForDraw);
-                    if (!TextUtils.isEmpty(b.event.location) && boxH > dp(48f)) {
-                        body = body + "\n📍 " + b.event.location.trim();
-                    } else if (b.event.isNotion() && !TextUtils.isEmpty(b.event.statusLabel) && boxH > dp(48f)) {
-                        body = body + "\n" + b.event.statusLabel;
+                if (visibleH < dp(29f)) {
+                    // Compact single-line centered rendering (crisp at 00:00–24:00 full-day zoom)
+                    CharSequence ellip = TextUtils.ellipsize(
+                            b.event.title, eventTitlePaint, textW, TextUtils.TruncateAt.END);
+                    Paint.FontMetrics fm = eventTitlePaint.getFontMetrics();
+                    float baseline = contentTop + (visibleH - fm.bottom - fm.top) * 0.5f;
+                    canvas.drawText(ellip, 0, ellip.length(), left + dp(4f), baseline, eventTitlePaint);
+                } else {
+                    int boxH = (int) (visibleH - dp(4.5f));
+                    String body = b.event.title;
+                    if (columnCount == 1 && boxH > dp(28f)) {
+                        body = b.event.title + "\n" + b.event.formatTimeRange(zoneForDraw);
+                        if (!TextUtils.isEmpty(b.event.location) && boxH > dp(46f)) {
+                            body = body + "\n📍 " + b.event.location.trim();
+                        } else if (b.event.isNotion() && !TextUtils.isEmpty(b.event.statusLabel) && boxH > dp(46f)) {
+                            body = body + "\n" + b.event.statusLabel;
+                        }
+                    } else if (!TextUtils.isEmpty(b.event.location) && boxH > dp(34f)) {
+                        body = b.event.title + "\n" + b.event.location.trim();
+                    } else if (b.event.isNotion() && !TextUtils.isEmpty(b.event.statusLabel) && boxH > dp(34f)) {
+                        body = b.event.title + "\n" + b.event.statusLabel;
                     }
-                } else if (!TextUtils.isEmpty(b.event.location) && boxH > dp(34f)) {
-                    body = b.event.title + "\n" + b.event.location.trim();
-                } else if (b.event.isNotion() && !TextUtils.isEmpty(b.event.statusLabel) && boxH > dp(34f)) {
-                    body = b.event.title + "\n" + b.event.statusLabel;
+                    canvas.save();
+                    canvas.clipRect(left + dp(4f), contentTop + dp(2.2f), left + dp(4f) + textW, bottom - dp(2f));
+                    canvas.translate(left + dp(4f), contentTop + dp(2.2f));
+                    StaticLayout sl = StaticLayout.Builder.obtain(body, 0, body.length(), eventTitlePaint, textW)
+                            .setAlignment(Layout.Alignment.ALIGN_NORMAL)
+                            .setIncludePad(false)
+                            .setMaxLines(Math.max(1, boxH / Math.max(1, Math.round(sp(13f)))))
+                            .setEllipsize(TextUtils.TruncateAt.END)
+                            .build();
+                    sl.draw(canvas);
+                    canvas.restore();
                 }
-                canvas.save();
-                canvas.clipRect(left + dp(3.5f), contentTop + dp(2.5f), left + dp(3.5f) + textW, bottom - dp(2.5f));
-                canvas.translate(left + dp(3.5f), contentTop + dp(2.5f));
-                StaticLayout sl = StaticLayout.Builder.obtain(body, 0, body.length(), eventTitlePaint, textW)
-                        .setAlignment(Layout.Alignment.ALIGN_NORMAL)
-                        .setIncludePad(false)
-                        .setMaxLines(Math.max(1, boxH / Math.max(1, Math.round(sp(13f)))))
-                        .setEllipsize(TextUtils.TruncateAt.END)
-                        .build();
-                sl.draw(canvas);
-                canvas.restore();
             }
         }
 

@@ -38,7 +38,7 @@ public final class AppPrefs {
     private static final String KEY_THEME_MODE = "themeMode";
     private static final String KEY_START_MONDAY = "startMonday";
     private static final String KEY_APP_HIDDEN_CALS = "appHiddenCalendars";
-    private static final String KEY_HOUR_HEIGHT_DP = "hourHeightDp";
+    private static final String KEY_HOUR_HEIGHT_DP = "hourHeightDp_v2";
 
     private static final String KEY_NOTIF_MODE = "notifMode";
     private static final String KEY_NOTION_DEFAULT_REMINDER_MIN = "notionDefaultReminderMin";
@@ -98,13 +98,16 @@ public final class AppPrefs {
         sp(context).edit().putStringSet(KEY_APP_HIDDEN_CALS, set).apply();
     }
 
+    /** Returns <= 0f when in full 00:00–24:00 fit mode (default), or explicit zoomed dp (..140f). */
     public static float getHourHeightDp(Context context) {
-        float v = sp(context).getFloat(KEY_HOUR_HEIGHT_DP, 54f);
-        return Math.max(30f, Math.min(140f, v));
+        float v = sp(context).getFloat(KEY_HOUR_HEIGHT_DP, -1f);
+        if (v <= 0f) return -1f;
+        return Math.min(140f, v);
     }
 
     public static void setHourHeightDp(Context context, float dp) {
-        sp(context).edit().putFloat(KEY_HOUR_HEIGHT_DP, Math.max(30f, Math.min(140f, dp))).apply();
+        float stored = (dp <= 0f) ? -1f : Math.min(140f, dp);
+        sp(context).edit().putFloat(KEY_HOUR_HEIGHT_DP, stored).apply();
     }
 
     // ===================== Event Notification Preferences =====================
