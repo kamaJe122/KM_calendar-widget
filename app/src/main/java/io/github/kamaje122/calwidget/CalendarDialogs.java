@@ -436,15 +436,22 @@ public final class CalendarDialogs {
             endTime[0] = defHour >= 23 ? LocalTime.of(23, 59) : LocalTime.of(defHour + 1, 0);
         }
 
+        final boolean[] targetNotion = {editingNotion
+                || (!isEdit && !destinations.isEmpty() && destinations.get(0).isNotion)};
+
+        final boolean[] userTouchedReminders = {false};
         final List<Integer> reminders = new ArrayList<>();
         final List<Integer> originalReminders = new ArrayList<>();
         if (editingSystem) {
             reminders.addAll(CalendarDataRepository.loadEventReminders(activity, existingEvent.eventId));
             originalReminders.addAll(reminders);
+        } else if (editingNotion) {
+            reminders.addAll(AppPrefs.getEffectiveNotionReminders(activity, existingEvent));
+            originalReminders.addAll(reminders);
+        } else {
+            int defMin = targetNotion[0] ? AppPrefs.getNotionDefaultReminderMinutes(activity) : 10;
+            if (defMin >= 0) reminders.add(defMin);
         }
-
-        final boolean[] targetNotion = {editingNotion
-                || (!isEdit && !destinations.isEmpty() && destinations.get(0).isNotion)};
 
         // ================= Floating card skeleton =================
         final Dialog dialog = new Dialog(activity);
@@ -773,6 +780,7 @@ public final class CalendarDialogs {
                 if (!readOnly) {
                     TextView x = makeIconButton(activity, "✕", palette.textSecondary, 15f);
                     x.setOnClickListener(v -> {
+                        userTouchedReminders[0] = true;
                         reminders.remove(m);
                         renderReminders[0].run();
                     });
@@ -793,6 +801,7 @@ public final class CalendarDialogs {
                     new AlertDialog.Builder(activity)
                             .setTitle("新增提醒")
                             .setItems(labels, (d, which) -> {
+                                userTouchedReminders[0] = true;
                                 if (!reminders.contains(opts[which])) reminders.add(opts[which]);
                                 renderReminders[0].run();
                             })
@@ -842,8 +851,14 @@ public final class CalendarDialogs {
             colorSquare.setBackground(roundedBg(color, dp(activity, 5)));
             calDot.setBackground(roundedBg(color, dp(activity, 7)));
             locRow.setVisibility(notion ? View.GONE : View.VISIBLE);
-            reminderRow.setVisibility(notion ? View.GONE : View.VISIBLE);
-            reminderDivider.setVisibility(notion ? View.GONE : View.VISIBLE);
+            reminderRow.setVisibility(View.VISIBLE);
+            reminderDivider.setVisibility(View.VISIBLE);
+            if (!isEdit && !userTouchedReminders[0]) {
+                reminders.clear();
+                int defMin = notion ? AppPrefs.getNotionDefaultReminderMinutes(activity) : 10;
+                if (defMin >= 0) reminders.add(defMin);
+                renderReminders[0].run();
+            }
             if (!notion) statusRow.setVisibility(View.GONE);
             if (!notion) computedDateHint.setVisibility(View.GONE);
             descInput.setHint(notion ? "Notion 備註／說明（若資料庫有文字欄位將同步）" : "新增說明");
@@ -1090,11 +1105,23 @@ public final class CalendarDialogs {
                 NotionManager.MutationCallback mutCb = new NotionManager.MutationCallback() {
                     @Override
                     public void onSuccess() {
+                        if (editingNotion && userTouchedReminders[0] && !TextUtils.isEmpty(existingEvent.notionPageId)) {
+                            AppPrefs.setCustomNotionReminders(activity, existingEvent.notionPageId, reminders);
+                        }
+                        EventReminderManager.scheduleAsync(activity);
                         dialog.dismiss();
                         Toast.makeText(activity,
                                 editingNotion ? "✅ 已儲存並同步回 Notion" : "✅ 已新增至 Notion",
                                 Toast.LENGTH_SHORT).show();
                         callbacks.onEventsMutated();
+                    }
+
+                    @Override
+                    public void onCreatedPage(String pageId) {
+                        if (userTouchedReminders[0] && !TextUtils.isEmpty(pageId)) {
+                            AppPrefs.setCustomNotionReminders(activity, pageId, reminders);
+                        }
+                        onSuccess();
                     }
 
                     @Override
@@ -1148,6 +1175,7 @@ public final class CalendarDialogs {
                     if (!reminders.isEmpty()) {
                         CalendarDataRepository.saveEventReminders(activity, newId, reminders);
                     }
+                    EventReminderManager.scheduleAsync(activity);
                     dialog.dismiss();
                     Toast.makeText(activity, "✅ 已新增並同步回 Google 日曆", Toast.LENGTH_SHORT).show();
                     callbacks.onEventsMutated();
@@ -1171,6 +1199,7 @@ public final class CalendarDialogs {
                     if (remindersChanged || (newRow && !reminders.isEmpty())) {
                         CalendarDataRepository.saveEventReminders(activity, resultId, reminders);
                     }
+                    EventReminderManager.scheduleAsync(activity);
                     dialog.dismiss();
                     Toast.makeText(activity, "✅ 已儲存並同步回 Google 日曆", Toast.LENGTH_SHORT).show();
                     callbacks.onEventsMutated();

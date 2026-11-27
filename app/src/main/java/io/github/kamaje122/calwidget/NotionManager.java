@@ -2018,6 +2018,9 @@ public final class NotionManager {
 
     public interface MutationCallback {
         void onSuccess();
+        default void onCreatedPage(String pageId) {
+            onSuccess();
+        }
         void onError(String message);
     }
 
@@ -2276,7 +2279,8 @@ public final class NotionManager {
                 // Follow-up background sync so server-side view filters stay 100% consistent
                 MAIN_HANDLER.postDelayed(() -> refreshEventsOnlyAsync(appContext, 0L, null), 1200L);
 
-                if (callback != null) MAIN_HANDLER.post(callback::onSuccess);
+                final String createdId = createdPage.optString("id", "");
+                if (callback != null) MAIN_HANDLER.post(() -> callback.onCreatedPage(createdId));
             } catch (Exception e) {
                 postMutErr(callback, "新增至 Notion 失敗：" + e.getMessage());
             }

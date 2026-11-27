@@ -3,6 +3,7 @@ package io.github.kamaje122.calwidget;
 import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.NotificationManager;
 import android.appwidget.AppWidgetManager;
 import android.content.Intent;
 import android.content.pm.PackageManager;
@@ -17,6 +18,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.text.SpannableString;
 import android.text.Spanned;
 import android.text.TextUtils;
@@ -38,6 +40,7 @@ import java.time.DayOfWeek;
 import java.time.LocalDate;
 import java.time.YearMonth;
 import java.time.temporal.TemporalAdjusters;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
@@ -57,8 +60,10 @@ public class MainActivity extends Activity {
 
     public static final String EXTRA_TARGET_EPOCH_DAY = "km_target_epoch_day";
     public static final String EXTRA_OPEN_CREATE_EVENT = "km_open_create_event";
+    public static final String EXTRA_DISMISS_NOTIF_ID = "km_dismiss_notif_id";
 
     private static final int REQ_PERMISSIONS = 201;
+    private static final int REQ_POST_NOTIF_PREVIEW = 202;
     private static final String[] CALENDAR_PERMS = {
             Manifest.permission.READ_CALENDAR,
             Manifest.permission.WRITE_CALENDAR
@@ -137,13 +142,26 @@ public class MainActivity extends Activity {
 
         viewMode = AppPrefs.getViewMode(this);
         palette = AppTheme.of(this);
+        EventReminderManager.ensureChannel(this);
 
         buildUiHierarchy();
         applyThemeToShell();
         handleIncomingDeepLink(launchIntent);
 
-        if (!CalendarDataRepository.hasReadPermission(this)) {
-            requestPermissions(CALENDAR_PERMS, REQ_PERMISSIONS);
+        List<String> initialPerms = new ArrayList<>();
+        if (!CalendarDataRepository.hasReadPermission(this) || !CalendarDataRepository.hasWritePermission(this)) {
+            initialPerms.add(Manifest.permission.READ_CALENDAR);
+            initialPerms.add(Manifest.permission.WRITE_CALENDAR);
+        }
+        if (Build.VERSION.SDK_INT >= 33
+                && AppPrefs.getNotifMode(this) != AppPrefs.NOTIF_MODE_OFF
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                && !AppPrefs.hasAskedPostNotifications(this)) {
+            AppPrefs.setAskedPostNotifications(this, true);
+            initialPerms.add(Manifest.permission.POST_NOTIFICATIONS);
+        }
+        if (!initialPerms.isEmpty()) {
+            requestPermissions(initialPerms.toArray(new String[0]), REQ_PERMISSIONS);
         }
 
         // Silent check for GitHub update badge on ⚙️ icon
@@ -195,6 +213,7 @@ public class MainActivity extends Activity {
         applyThemeToShell();
         rebuildDrawerContent();
         reloadCalendarData();
+        EventReminderManager.scheduleAsync(this);
     }
 
     @Override
@@ -210,12 +229,23 @@ public class MainActivity extends Activity {
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         CalendarWidgetProvider.updateAll(this);
+        EventReminderManager.scheduleAsync(this);
+        if (requestCode == REQ_POST_NOTIF_PREVIEW && EventReminderManager.canPostNotifications(this)) {
+            triggerTestNotificationPreview();
+        }
         rebuildDrawerContent();
         reloadCalendarData();
     }
 
     private void handleIncomingDeepLink(Intent intent) {
         if (intent == null) return;
+        if (intent.hasExtra(EXTRA_DISMISS_NOTIF_ID)) {
+            int nid = intent.getIntExtra(EXTRA_DISMISS_NOTIF_ID, 0);
+            intent.removeExtra(EXTRA_DISMISS_NOTIF_ID);
+            NotificationManager nm = getSystemService(NotificationManager.class);
+            if (nm != null && nid != 0) nm.cancel(nid);
+            EventReminderManager.syncGroupSummary(this);
+        }
         if (intent.hasExtra(EXTRA_TARGET_EPOCH_DAY)) {
             long epoch = intent.getLongExtra(EXTRA_TARGET_EPOCH_DAY, LocalDate.now().toEpochDay());
             anchorDate = LocalDate.ofEpochDay(epoch);
@@ -704,6 +734,59 @@ public class MainActivity extends Activity {
 
         addDrawerDivider();
 
+        // 5B. Event Reminder Notification Controls
+        TextView notifHeader = new TextView(this);
+        notifHeader.setText("🔔 行程提醒通知");
+        notifHeader.setTextSize(12f);
+        notifHeader.setTypeface(Typeface.DEFAULT_BOLD);
+        notifHeader.setTextColor(palette.textSecondary);
+        notifHeader.setPadding(dp(10), dp(6), dp(10), dp(6));
+        drawerContent.addView(notifHeader);
+
+        int notifMode = AppPrefs.getNotifMode(this);
+        LinearLayout notifModeRow = new LinearLayout(this);
+        notifModeRow.setOrientation(LinearLayout.HORIZONTAL);
+        notifModeRow.setPadding(dp(6), 0, dp(6), dp(6));
+        addSegmentPill(notifModeRow, "全部通知", notifMode == AppPrefs.NOTIF_MODE_ALL,
+                () -> changeNotifMode(AppPrefs.NOTIF_MODE_ALL));
+        addSegmentPill(notifModeRow, "僅 Notion", notifMode == AppPrefs.NOTIF_MODE_NOTION_ONLY,
+                () -> changeNotifMode(AppPrefs.NOTIF_MODE_NOTION_ONLY));
+        addSegmentPill(notifModeRow, "關閉", notifMode == AppPrefs.NOTIF_MODE_OFF,
+                () -> changeNotifMode(AppPrefs.NOTIF_MODE_OFF));
+        drawerContent.addView(notifModeRow);
+
+        if (notifMode != AppPrefs.NOTIF_MODE_OFF) {
+            int notionDefMin = AppPrefs.getNotionDefaultReminderMinutes(this);
+            int snoozeMin = AppPrefs.getSnoozeMinutes(this);
+            LinearLayout cfgRow = new LinearLayout(this);
+            cfgRow.setOrientation(LinearLayout.HORIZONTAL);
+            cfgRow.setPadding(dp(6), 0, dp(6), dp(6));
+            addSegmentPill(cfgRow, "Notion：" + formatShortOffset(notionDefMin) + " ▾", false,
+                    this::showNotionDefaultReminderPicker);
+            addSegmentPill(cfgRow, "延後：" + snoozeMin + " 分鐘 ▾", false,
+                    this::showSnoozeMinutesPicker);
+            drawerContent.addView(cfgRow);
+
+            TextView previewBtn = new TextView(this);
+            previewBtn.setText("🔔 發送測試通知預覽（查看群組摺疊 ＆ 延後效果）");
+            previewBtn.setTextSize(12.2f);
+            previewBtn.setTypeface(Typeface.DEFAULT_BOLD);
+            previewBtn.setGravity(Gravity.CENTER);
+            previewBtn.setPadding(dp(10), dp(8), dp(10), dp(8));
+            GradientDrawable pvBg = new GradientDrawable();
+            pvBg.setCornerRadius(dp(14));
+            pvBg.setColor(palette.chipBg);
+            previewBtn.setBackground(pvBg);
+            previewBtn.setTextColor(palette.selectedStroke);
+            previewBtn.setOnClickListener(v -> triggerTestNotificationPreview());
+            LinearLayout.LayoutParams pvLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            pvLp.setMargins(dp(8), 0, dp(8), dp(6));
+            drawerContent.addView(previewBtn, pvLp);
+        }
+
+        addDrawerDivider();
+
         // 6. Calendar Account Checkboxes (Notion + Google/System Accounts)
         Set<String> appHidden = AppPrefs.getAppHiddenCalendars(this);
 
@@ -857,6 +940,112 @@ public class MainActivity extends Activity {
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
         lp.setMargins(dp(3), 0, dp(3), 0);
         parent.addView(tv, lp);
+    }
+
+    private static String formatShortOffset(int min) {
+        if (min < 0) return "不預設";
+        if (min == 0) return "開始時";
+        if (min % 60 == 0) return (min / 60) + "小時前";
+        return min + "分前";
+    }
+
+    private void changeNotifMode(int mode) {
+        AppPrefs.setNotifMode(this, mode);
+        if (mode != AppPrefs.NOTIF_MODE_OFF
+                && Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_PERMISSIONS);
+        }
+        EventReminderManager.scheduleAsync(this);
+        rebuildDrawerContent();
+    }
+
+    private void showNotionDefaultReminderPicker() {
+        final int[] opts = {0, 5, 10, 15, 30, 60, 120, -1};
+        final String[] labels = {
+                "活動開始時",
+                "5 分鐘之前",
+                "10 分鐘之前（預設）",
+                "15 分鐘之前",
+                "30 分鐘之前",
+                "1 小時之前",
+                "2 小時之前",
+                "不自動提醒（僅單筆手動新增時提醒）"
+        };
+        int cur = AppPrefs.getNotionDefaultReminderMinutes(this);
+        int checked = 2;
+        for (int i = 0; i < opts.length; i++) {
+            if (opts[i] == cur) {
+                checked = i;
+                break;
+            }
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("Notion 行程預設提醒時間")
+                .setSingleChoiceItems(labels, checked, (d, which) -> {
+                    AppPrefs.setNotionDefaultReminderMinutes(this, opts[which]);
+                    EventReminderManager.scheduleAsync(this);
+                    rebuildDrawerContent();
+                    d.dismiss();
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void showSnoozeMinutesPicker() {
+        final int[] opts = {5, 10, 15, 30, 60};
+        final String[] labels = {
+                "5 分鐘",
+                "10 分鐘（預設）",
+                "15 分鐘",
+                "30 分鐘",
+                "1 小時"
+        };
+        int cur = AppPrefs.getSnoozeMinutes(this);
+        int checked = 1;
+        for (int i = 0; i < opts.length; i++) {
+            if (opts[i] == cur) {
+                checked = i;
+                break;
+            }
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("通知「延後」預設時間")
+                .setSingleChoiceItems(labels, checked, (d, which) -> {
+                    AppPrefs.setSnoozeMinutes(this, opts[which]);
+                    rebuildDrawerContent();
+                    d.dismiss();
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void triggerTestNotificationPreview() {
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQ_POST_NOTIF_PREVIEW);
+            return;
+        }
+        if (!EventReminderManager.canPostNotifications(this)) {
+            Toast.makeText(this, "請先在系統設定開啟「KM 行事曆」通知權限", Toast.LENGTH_LONG).show();
+            try {
+                Intent settings = new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                        .putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName());
+                startActivity(settings);
+            } catch (Exception ignored) {
+            }
+            return;
+        }
+        dataExecutor.execute(() -> {
+            boolean sent = EventReminderManager.sendPreviewNotifications(getApplicationContext());
+            mainHandler.post(() -> {
+                if (sent) {
+                    Toast.makeText(MainActivity.this,
+                            "✅ 已送出 2 筆預覽通知！請下拉通知欄查看摺疊／展開與「延後」效果",
+                            Toast.LENGTH_LONG).show();
+                }
+            });
+        });
     }
 
     private void addAccountSectionHeader(String title, String subtitle) {

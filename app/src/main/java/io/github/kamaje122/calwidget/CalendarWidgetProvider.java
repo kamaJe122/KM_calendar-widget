@@ -346,6 +346,7 @@ public class CalendarWidgetProvider extends AppWidgetProvider {
     }
 
     static void updateAll(Context context) {
+        EventReminderManager.scheduleAsync(context);
         AppWidgetManager mgr = AppWidgetManager.getInstance(context);
         int[] ids = getActiveWidgetIds(context);
         if (ids.length == 0) {

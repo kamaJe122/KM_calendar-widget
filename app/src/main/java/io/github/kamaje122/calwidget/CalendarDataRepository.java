@@ -1032,6 +1032,45 @@ public final class CalendarDataRepository {
         return out;
     }
 
+    /** Batch-loads reminder offsets (minutes before start) keyed by eventId in a single query. */
+    public static Map<Long, List<Integer>> loadRemindersForEvents(Context context, Set<Long> eventIds) {
+        Map<Long, List<Integer>> map = new HashMap<>();
+        if (eventIds == null || eventIds.isEmpty() || !hasReadPermission(context)) return map;
+        StringBuilder inClause = new StringBuilder();
+        for (Long id : eventIds) {
+            if (id == null || id < 0) continue;
+            if (inClause.length() > 0) inClause.append(',');
+            inClause.append(id);
+        }
+        if (inClause.length() == 0) return map;
+        String sel = CalendarContract.Reminders.EVENT_ID + " IN (" + inClause + ")";
+        try (Cursor c = context.getContentResolver().query(
+                CalendarContract.Reminders.CONTENT_URI,
+                new String[]{
+                        CalendarContract.Reminders.EVENT_ID,
+                        CalendarContract.Reminders.MINUTES,
+                        CalendarContract.Reminders.METHOD
+                },
+                sel, null, null)) {
+            if (c != null) {
+                while (c.moveToNext()) {
+                    int method = c.isNull(2) ? CalendarContract.Reminders.METHOD_DEFAULT : c.getInt(2);
+                    if (method != CalendarContract.Reminders.METHOD_DEFAULT
+                            && method != CalendarContract.Reminders.METHOD_ALERT) {
+                        continue; // skip email/SMS-only reminders
+                    }
+                    long eid = c.getLong(0);
+                    int min = c.getInt(1);
+                    if (min == -1) min = 10; // MINUTES_DEFAULT (-1) -> 10 min
+                    List<Integer> list = map.computeIfAbsent(eid, k -> new ArrayList<>());
+                    if (!list.contains(min)) list.add(min);
+                }
+            }
+        } catch (RuntimeException ignored) {
+        }
+        return map;
+    }
+
     /** Replaces all reminders of the event with popup alerts at the given offsets. */
     public static boolean saveEventReminders(Context context, long eventId, List<Integer> minutesBefore) {
         if (eventId < 0 || !hasWritePermission(context)) return false;
