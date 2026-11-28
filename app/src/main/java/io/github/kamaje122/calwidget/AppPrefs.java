@@ -45,6 +45,10 @@ public final class AppPrefs {
     private static final String KEY_SNOOZE_MINUTES = "snoozeMinutes";
     private static final String KEY_ASKED_POST_NOTIF = "askedPostNotif";
     private static final String PREFIX_NOTION_REMINDERS = "notionRem_";
+    private static final String KEY_EVENT_DRAG_HOLD_MS = "eventDragHoldMs";
+
+    /** Default hold duration (ms) before an event enters drag-to-reschedule mode (0 = disabled). */
+    public static final int DEFAULT_EVENT_DRAG_HOLD_MS = 500;
 
     private AppPrefs() {
     }
@@ -239,5 +243,30 @@ public final class AppPrefs {
 
     public static int resolveNotionEventColor(Context context, String notionPageId, int sourceDefaultColor) {
         return getCustomNotionEventColor(context, notionPageId, sourceDefaultColor);
+    }
+
+    // ===================== Event Long-Press Drag-to-Reschedule Delay =====================
+
+    /**
+     * Hold duration in milliseconds required to start dragging an event on the timeline.
+     * Returns 0 when disabled, otherwise clamped to [150, 3000]. Default is 500 ms (0.5s).
+     */
+    public static int getEventDragHoldMs(Context context) {
+        int raw = sp(context).getInt(KEY_EVENT_DRAG_HOLD_MS, DEFAULT_EVENT_DRAG_HOLD_MS);
+        if (raw <= 0) return 0;
+        return Math.max(150, Math.min(3000, raw));
+    }
+
+    public static void setEventDragHoldMs(Context context, int delayMs) {
+        int normalized = (delayMs <= 0) ? 0 : Math.max(150, Math.min(3000, delayMs));
+        sp(context).edit().putInt(KEY_EVENT_DRAG_HOLD_MS, normalized).apply();
+    }
+
+    public static String formatDragHoldLabel(int delayMs) {
+        if (delayMs <= 0) return "已關閉";
+        if (delayMs % 100 == 0) {
+            return String.format(Locale.US, "%.1f 秒", delayMs / 1000f);
+        }
+        return String.format(Locale.US, "%.2f 秒", delayMs / 1000f);
     }
 }

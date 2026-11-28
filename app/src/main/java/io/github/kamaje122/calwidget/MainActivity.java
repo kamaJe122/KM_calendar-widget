@@ -22,6 +22,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.provider.CalendarContract;
 import android.provider.Settings;
+import android.text.InputType;
 import android.text.SpannableString;
 import android.text.Spanned;
 import android.text.TextUtils;
@@ -33,6 +34,7 @@ import android.view.Window;
 import android.view.WindowInsetsController;
 import android.widget.Button;
 import android.widget.CheckBox;
+import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -80,6 +82,8 @@ public class MainActivity extends Activity {
     private AppTheme.Palette palette;
     private int viewMode;
     private LocalDate anchorDate = LocalDate.now();
+    private LocalDate timelineBufStart = null;
+    private LocalDate timelineBufEnd = null;
     private boolean hasAvailableUpdate = false;
 
     // Root & Shell Views
@@ -479,17 +483,10 @@ public class MainActivity extends Activity {
         });
 
         timelineView = new MultiDayTimelineView(this);
-        timelineView.setShowPencilBadges(true);
         timelineView.setListener(new MultiDayTimelineView.Listener() {
             @Override
             public void onEventClicked(CalendarEvent event) {
                 CalendarDialogs.showEventDetailDialog(MainActivity.this, event, palette, dialogCallbacks);
-            }
-
-            @Override
-            public void onEventEditClicked(CalendarEvent event) {
-                CalendarDialogs.showEventEditorDialog(MainActivity.this, event,
-                        LocalDate.ofEpochDay(event.startEpochDay), -1, palette, dialogCallbacks);
             }
 
             @Override
@@ -514,6 +511,29 @@ public class MainActivity extends Activity {
             public void onSwipePeriod(int deltaDays) {
                 anchorDate = anchorDate.plusDays(deltaDays);
                 reloadCalendarData();
+            }
+
+            @Override
+            public void onVisibleStartDateChanged(LocalDate newStartDate, boolean settled) {
+                anchorDate = newStartDate;
+                updateTopHeaderLabels();
+                if (timelineBufStart == null || timelineBufEnd == null
+                        || newStartDate.isBefore(timelineBufStart.plusDays(10))
+                        || newStartDate.isAfter(timelineBufEnd.minusDays(14))) {
+                    reloadTimelineBufferSeamless(newStartDate);
+                }
+            }
+
+            @Override
+            public void onEventDragged(
+                    CalendarEvent event,
+                    boolean allDay,
+                    LocalDate newStartDate,
+                    LocalDate newEndDate,
+                    long newBeginMillis,
+                    long newEndMillis) {
+                CalendarDialogs.handleEventDragged(MainActivity.this, event, allDay,
+                        newStartDate, newEndDate, newBeginMillis, newEndMillis, palette, dialogCallbacks);
             }
         });
 
@@ -608,6 +628,61 @@ public class MainActivity extends Activity {
         syncStatusStrip.setVisibility(View.VISIBLE);
     }
 
+    private void updateTopHeaderLabels() {
+        final int mode = viewMode;
+        final boolean startMonday = AppPrefs.isStartWeekOnMonday(this);
+        final DayOfWeek firstDow = startMonday ? DayOfWeek.MONDAY : DayOfWeek.SUNDAY;
+        final LocalDate anchor = anchorDate;
+
+        LocalDate lunarStart;
+        LocalDate lunarEnd;
+        if (mode == AppPrefs.VIEW_MONTH) {
+            YearMonth ym = YearMonth.from(anchor);
+            lunarStart = ym.atDay(1);
+            lunarEnd = ym.atEndOfMonth();
+        } else if (mode == AppPrefs.VIEW_WEEK) {
+            lunarStart = anchor.with(TemporalAdjusters.previousOrSame(firstDow));
+            lunarEnd = lunarStart.plusDays(6);
+        } else if (mode == AppPrefs.VIEW_DAY_3) {
+            lunarStart = anchor;
+            lunarEnd = anchor.plusDays(2);
+        } else {
+            lunarStart = anchor;
+            lunarEnd = anchor;
+        }
+
+        int curYear = LocalDate.now().getYear();
+        String monthText = (anchor.getYear() == curYear)
+                ? (anchor.getMonthValue() + "月 ▾")
+                : (anchor.getYear() + "年" + anchor.getMonthValue() + "月 ▾");
+        topMonthTitle.setText(monthText);
+        topLunarSubtitle.setText(LunarCalendarHelper.getRangeHeaderSubtitle(lunarStart, lunarEnd));
+    }
+
+    /** Expands the timeline's ±28-day event buffer seamlessly mid-scroll without resetting drag offset. */
+    private void reloadTimelineBufferSeamless(LocalDate centerDate) {
+        final LocalDate bufS = centerDate.minusDays(28);
+        final LocalDate bufE = centerDate.plusDays(34);
+        timelineBufStart = bufS;
+        timelineBufEnd = bufE;
+        final int gen = ++loadGeneration;
+        final Set<String> hiddenKeys = AppPrefs.getAppHiddenCalendars(this);
+        final AppTheme.Palette pal = palette;
+
+        dataExecutor.execute(() -> {
+            List<CalendarEvent> events = CalendarDataRepository.loadEventsInRange(
+                    getApplicationContext(), bufS, bufE, hiddenKeys);
+            mainHandler.post(() -> {
+                if (gen != loadGeneration || isFinishing()) return;
+                if (viewMode == AppPrefs.VIEW_DAY_1
+                        || viewMode == AppPrefs.VIEW_DAY_3
+                        || viewMode == AppPrefs.VIEW_WEEK) {
+                    timelineView.updateBufferedEvents(events, pal);
+                }
+            });
+        });
+    }
+
     private void reloadCalendarData() {
         boolean hasPerm = CalendarDataRepository.hasReadPermission(this);
         boolean hasNotion = NotionManager.hasToken(this);
@@ -623,47 +698,33 @@ public class MainActivity extends Activity {
         final LocalDate anchor = anchorDate;
         final AppTheme.Palette pal = palette;
 
-        // Update Top App Bar Month & Lunar Range Subtitle immediately
-        LocalDate lunarStart;
-        LocalDate lunarEnd;
+        updateTopHeaderLabels();
+
+        LocalDate periodStart = anchor;
         LocalDate queryStart;
         LocalDate queryEnd;
 
         if (mode == AppPrefs.VIEW_MONTH) {
             YearMonth ym = YearMonth.from(anchor);
-            lunarStart = ym.atDay(1);
-            lunarEnd = ym.atEndOfMonth();
             queryStart = ym.atDay(1).with(TemporalAdjusters.previousOrSame(firstDow));
             queryEnd = queryStart.plusDays(41);
         } else if (mode == AppPrefs.VIEW_WEEK) {
-            queryStart = anchor.with(TemporalAdjusters.previousOrSame(firstDow));
-            queryEnd = queryStart.plusDays(6);
-            lunarStart = queryStart;
-            lunarEnd = queryEnd;
-        } else if (mode == AppPrefs.VIEW_DAY_3) {
-            queryStart = anchor;
-            queryEnd = anchor.plusDays(2);
-            lunarStart = queryStart;
-            lunarEnd = queryEnd;
-        } else if (mode == AppPrefs.VIEW_DAY_1) {
-            queryStart = anchor;
-            queryEnd = anchor;
-            lunarStart = anchor;
-            lunarEnd = anchor;
+            periodStart = anchor.with(TemporalAdjusters.previousOrSame(firstDow));
+            queryStart = periodStart.minusDays(28);
+            queryEnd = periodStart.plusDays(34);
+            timelineBufStart = queryStart;
+            timelineBufEnd = queryEnd;
+        } else if (mode == AppPrefs.VIEW_DAY_3 || mode == AppPrefs.VIEW_DAY_1) {
+            periodStart = anchor;
+            queryStart = periodStart.minusDays(28);
+            queryEnd = periodStart.plusDays(34);
+            timelineBufStart = queryStart;
+            timelineBufEnd = queryEnd;
         } else {
             // VIEW_SCHEDULE
-            lunarStart = anchor;
-            lunarEnd = anchor;
             queryStart = anchor.minusDays(60);
             queryEnd = anchor.plusDays(180);
         }
-
-        int curYear = LocalDate.now().getYear();
-        String monthText = (anchor.getYear() == curYear)
-                ? (anchor.getMonthValue() + "月 ▾")
-                : (anchor.getYear() + "年" + anchor.getMonthValue() + "月 ▾");
-        topMonthTitle.setText(monthText);
-        topLunarSubtitle.setText(LunarCalendarHelper.getRangeHeaderSubtitle(lunarStart, lunarEnd));
 
         // Ensure correct active view in viewportFrame
         View desiredView;
@@ -684,6 +745,7 @@ public class MainActivity extends Activity {
         final Set<String> hiddenKeys = AppPrefs.getAppHiddenCalendars(this);
         final LocalDate fStart = queryStart;
         final LocalDate fEnd = queryEnd;
+        final LocalDate fPeriodStart = periodStart;
 
         dataExecutor.execute(() -> {
             List<CalendarEvent> events = CalendarDataRepository.loadEventsInRange(
@@ -700,7 +762,7 @@ public class MainActivity extends Activity {
                     scheduleView.setData(fStart, fEnd, anchor, startMonday, pal, grouped);
                 } else {
                     int cols = (mode == AppPrefs.VIEW_WEEK) ? 7 : (mode == AppPrefs.VIEW_DAY_3 ? 3 : 1);
-                    timelineView.setData(fStart, cols, pal, events);
+                    timelineView.setData(fPeriodStart, cols, pal, events);
                 }
             });
         });
@@ -850,6 +912,28 @@ public class MainActivity extends Activity {
         addSegmentPill(dowRow, "週日起始", !startMon, () -> changeWeekStart(false));
         addSegmentPill(dowRow, "週一起始", startMon, () -> changeWeekStart(true));
         drawerContent.addView(dowRow);
+
+        addDrawerDivider();
+
+        // 5A. Long-Press Event Drag Detection Time Control
+        TextView dragHeader = new TextView(this);
+        dragHeader.setText("✋ 事件長按拖曳改時間");
+        dragHeader.setTextSize(12f);
+        dragHeader.setTypeface(Typeface.DEFAULT_BOLD);
+        dragHeader.setTextColor(palette.textSecondary);
+        dragHeader.setPadding(dp(10), dp(6), dp(10), dp(6));
+        drawerContent.addView(dragHeader);
+
+        int dragHoldMs = AppPrefs.getEventDragHoldMs(this);
+        LinearLayout dragCfgRow = new LinearLayout(this);
+        dragCfgRow.setOrientation(LinearLayout.HORIZONTAL);
+        dragCfgRow.setPadding(dp(6), 0, dp(6), dp(6));
+        addSegmentPill(dragCfgRow,
+                "偵測時間：" + AppPrefs.formatDragHoldLabel(dragHoldMs) + " ▾",
+                dragHoldMs > 0,
+                this::showDragHoldDelayPicker);
+        addSegmentPill(dragCfgRow, "✏️ 自訂秒數", false, this::showCustomDragHoldDialog);
+        drawerContent.addView(dragCfgRow);
 
         addDrawerDivider();
 
@@ -1134,6 +1218,90 @@ public class MainActivity extends Activity {
                     AppPrefs.setSnoozeMinutes(this, opts[which]);
                     rebuildDrawerContent();
                     d.dismiss();
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void showDragHoldDelayPicker() {
+        final int[] opts = {200, 350, 500, 800, 1000, 1500, 2000, -99, 0};
+        final String[] labels = {
+                "0.2 秒（極快）",
+                "0.35 秒（快速）",
+                "0.5 秒（預設推薦）",
+                "0.8 秒（防誤觸）",
+                "1.0 秒",
+                "1.5 秒",
+                "2.0 秒",
+                "✏️ 自訂秒數（0.15 ～ 3.0 秒）…",
+                "關閉長按拖曳改時間"
+        };
+        int cur = AppPrefs.getEventDragHoldMs(this);
+        int checked = -1;
+        for (int i = 0; i < opts.length; i++) {
+            if (opts[i] == cur) {
+                checked = i;
+                break;
+            }
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("✋ 長按事件拖曳偵測時間")
+                .setSingleChoiceItems(labels, checked, (d, which) -> {
+                    d.dismiss();
+                    if (opts[which] == -99) {
+                        showCustomDragHoldDialog();
+                    } else {
+                        AppPrefs.setEventDragHoldMs(this, opts[which]);
+                        rebuildDrawerContent();
+                        Toast.makeText(this,
+                                opts[which] <= 0 ? "已關閉長按拖曳"
+                                        : ("✅ 長按偵測時間已設為 " + AppPrefs.formatDragHoldLabel(opts[which])),
+                                Toast.LENGTH_SHORT).show();
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void showCustomDragHoldDialog() {
+        int curMs = AppPrefs.getEventDragHoldMs(this);
+        float initSec = (curMs > 0 ? curMs : AppPrefs.DEFAULT_EVENT_DRAG_HOLD_MS) / 1000f;
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(22), dp(14), dp(22), dp(6));
+
+        TextView tip = new TextView(this);
+        tip.setText("請輸入按住事件幾秒後進入「拖曳更改時間」模式（支援小數點，範圍 0.15 ～ 3.0 秒；輸入 0 代表關閉）：");
+        tip.setTextSize(13.5f);
+        tip.setTextColor(palette.textSecondary);
+        box.addView(tip);
+
+        EditText input = new EditText(this);
+        input.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        input.setText(String.format(Locale.US, curMs % 100 == 0 ? "%.1f" : "%.2f", initSec));
+        input.setSelection(input.getText().length());
+        input.setTextColor(palette.textPrimary);
+        box.addView(input);
+
+        new AlertDialog.Builder(this)
+                .setTitle("✏️ 自訂長按拖曳偵測秒數")
+                .setView(box)
+                .setPositiveButton("儲存", (d, w) -> {
+                    String raw = input.getText().toString().trim();
+                    try {
+                        float sec = Float.parseFloat(raw);
+                        int ms = sec <= 0f ? 0 : Math.round(sec * 1000f);
+                        AppPrefs.setEventDragHoldMs(this, ms);
+                        rebuildDrawerContent();
+                        int saved = AppPrefs.getEventDragHoldMs(this);
+                        Toast.makeText(this,
+                                saved <= 0 ? "已關閉長按拖曳"
+                                        : ("✅ 長按偵測時間已設為 " + AppPrefs.formatDragHoldLabel(saved)),
+                                Toast.LENGTH_SHORT).show();
+                    } catch (NumberFormatException e) {
+                        Toast.makeText(this, "請輸入有效數字（例如 0.5 或 1.2）", Toast.LENGTH_SHORT).show();
+                    }
                 })
                 .setNegativeButton("取消", null)
                 .show();

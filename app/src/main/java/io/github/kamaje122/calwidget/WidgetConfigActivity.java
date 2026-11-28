@@ -18,6 +18,7 @@ import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
 import android.provider.CalendarContract;
+import android.text.InputType;
 import android.text.SpannableString;
 import android.text.Spanned;
 import android.text.TextUtils;
@@ -80,6 +81,11 @@ public class WidgetConfigActivity extends Activity {
     private TextView daysValue;
     private TextView sectionDisplayTitle;
     private TextView sectionCalendarsTitle;
+
+    private Switch switchDragEnable;
+    private TextView dragHoldValue;
+    private View dragHoldControlsRow;
+    private boolean updatingDragProgrammatically;
 
     private TextView updateStatus;
     private ProgressBar updateProgress;
@@ -162,6 +168,30 @@ public class WidgetConfigActivity extends Activity {
         btnNotionClear.setOnClickListener(v -> confirmClearNotion());
         btnNotionAddUrl.setOnClickListener(v -> showAddNotionByUrlDialog());
         btnNotionAddCustom.setOnClickListener(v -> showAddCustomNotionDialog());
+
+        switchDragEnable = findViewById(R.id.switch_drag_enable);
+        dragHoldValue = findViewById(R.id.drag_hold_value);
+        dragHoldControlsRow = findViewById(R.id.drag_hold_controls_row);
+        switchDragEnable.setOnCheckedChangeListener((btn, checked) -> {
+            if (updatingDragProgrammatically) return;
+            AppPrefs.setEventDragHoldMs(this, checked ? AppPrefs.DEFAULT_EVENT_DRAG_HOLD_MS : 0);
+            refreshDragHoldControls();
+        });
+        findViewById(R.id.btn_drag_minus).setOnClickListener(v -> {
+            int cur = AppPrefs.getEventDragHoldMs(this);
+            if (cur > 0) {
+                AppPrefs.setEventDragHoldMs(this, Math.max(150, cur - 100));
+                refreshDragHoldControls();
+            }
+        });
+        findViewById(R.id.btn_drag_plus).setOnClickListener(v -> {
+            int cur = AppPrefs.getEventDragHoldMs(this);
+            if (cur > 0) {
+                AppPrefs.setEventDragHoldMs(this, Math.min(3000, cur + 100));
+                refreshDragHoldControls();
+            }
+        });
+        findViewById(R.id.btn_drag_custom).setOnClickListener(v -> promptCustomDragSeconds());
 
         widgetTabs = findViewById(R.id.widget_tabs);
         editingTargetLabel = findViewById(R.id.editing_target_label);
@@ -710,6 +740,52 @@ public class WidgetConfigActivity extends Activity {
         }
     }
 
+    private void refreshDragHoldControls() {
+        if (switchDragEnable == null || dragHoldValue == null || dragHoldControlsRow == null) return;
+        int cur = AppPrefs.getEventDragHoldMs(this);
+        boolean enabled = cur > 0;
+        updatingDragProgrammatically = true;
+        switchDragEnable.setChecked(enabled);
+        updatingDragProgrammatically = false;
+        dragHoldValue.setText(enabled
+                ? ("目前長按偵測秒數：" + AppPrefs.formatDragHoldLabel(cur) + "（支援 0.15 ～ 3.0 秒）")
+                : "目前已關閉長按拖曳更改時間");
+        dragHoldControlsRow.setVisibility(enabled ? View.VISIBLE : View.GONE);
+    }
+
+    private void promptCustomDragSeconds() {
+        int cur = AppPrefs.getEventDragHoldMs(this);
+        float initSec = (cur > 0 ? cur : AppPrefs.DEFAULT_EVENT_DRAG_HOLD_MS) / 1000f;
+
+        EditText input = new EditText(this);
+        input.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        input.setText(String.format(Locale.US, cur % 100 == 0 ? "%.1f" : "%.2f", initSec));
+        input.setSelection(input.getText().length());
+        int pad = dp(20);
+        LinearLayout wrap = new LinearLayout(this);
+        wrap.setPadding(pad, dp(12), pad, 0);
+        wrap.addView(input, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        new AlertDialog.Builder(this)
+                .setTitle("✏️ 自訂長按事件拖曳偵測秒數")
+                .setMessage("請輸入按住事件幾秒後啟動拖曳改時間（0.15 ～ 3.0 秒；輸入 0 代表關閉）：")
+                .setView(wrap)
+                .setPositiveButton("儲存", (d, w) -> {
+                    try {
+                        float sec = Float.parseFloat(input.getText().toString().trim());
+                        int ms = sec <= 0f ? 0 : Math.round(sec * 1000f);
+                        AppPrefs.setEventDragHoldMs(this, ms);
+                        refreshDragHoldControls();
+                        Toast.makeText(this, "✅ 已儲存長按偵測設定", Toast.LENGTH_SHORT).show();
+                    } catch (NumberFormatException e) {
+                        Toast.makeText(this, "請輸入有效數字（例如 0.5 或 1.2）", Toast.LENGTH_SHORT).show();
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
     private void refresh() {
         boolean granted = hasCalPermission();
         status.setText(granted ? R.string.status_granted : R.string.status_denied);
@@ -720,6 +796,7 @@ public class WidgetConfigActivity extends Activity {
             grant.setText(R.string.btn_grant);
         }
 
+        refreshDragHoldControls();
         refreshWidgetSelectorTabs();
         refreshNotionUiState();
         showCalendars(granted);

@@ -26,8 +26,8 @@ android {
         applicationId = "io.github.kamaje122.calwidget"
         minSdk = 31
         targetSdk = 36
-        versionCode = 18
-        versionName = "3.5.2"
+        versionCode = 19
+        versionName = "3.6.0"
     }
 
     signingConfigs {

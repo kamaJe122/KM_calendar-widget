@@ -251,6 +251,83 @@
                 android:visibility="gone" />
         </LinearLayout>
 
+        <!-- Main App Long-Press Event Drag Detection Time Card -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:background="@drawable/card_bg"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="✋ 行事曆互動：事件長按拖曳改時間"
+                android:textColor="@color/accent"
+                android:textSize="17sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:lineSpacingExtra="3dp"
+                android:text="在天／3天／週／單日時間軸視圖中，按住行程滿設定秒數即可上下拖曳修改時間、左右跨日移動："
+                android:textSize="13sp" />
+
+            <Switch
+                android:id="@+id/switch_drag_enable"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:minHeight="44dp"
+                android:text="啟用長按事件拖曳更改時間"
+                android:textSize="15sp" />
+
+            <TextView
+                android:id="@+id/drag_hold_value"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:textSize="15sp"
+                android:textStyle="bold" />
+
+            <LinearLayout
+                android:id="@+id/drag_hold_controls_row"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/btn_drag_minus"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="− 0.1秒"
+                    android:textSize="13sp" />
+
+                <Button
+                    android:id="@+id/btn_drag_custom"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1.2"
+                    android:text="✏️ 輸入秒數"
+                    android:textSize="13sp" />
+
+                <Button
+                    android:id="@+id/btn_drag_plus"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:text="＋ 0.1秒"
+                    android:textSize="13sp" />
+            </LinearLayout>
+        </LinearLayout>
+
         <!-- Per-Widget Instance Selector Card -->
         <LinearLayout
             android:id="@+id/widget_selector_card"
